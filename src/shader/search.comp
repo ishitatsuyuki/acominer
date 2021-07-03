@@ -1,0 +1,190 @@
+// Copyright 2021 Tatsuyuki Ishi <ishitatsuyuki@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+#version 450
+#ifdef WAVE64
+layout(local_size_x = 64) in;
+#else
+layout(local_size_x = 32) in;
+#endif
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_buffer_reference : require
+
+#include "hash.h"
+#include "struct.h"
+#include "transpose.h"
+#include "util.h"
+
+layout(push_constant) uniform PushConstants {
+    Config conf;
+};
+
+layout(set = 0, binding = 0) buffer OutBuf {
+    Output out_;
+};
+
+shared uint shuf_s[16][gl_WorkGroupSize];
+shared uint shuf_mix[4][gl_WorkGroupSize];
+shared uint shuf_cmix[8][gl_WorkGroupSize];
+
+void main() {
+    // Work distribution (64 threads in one workgroup):
+    // Step 1: sha3_512(header + nonce[::-1])
+    //         Each thread process 1 nonce
+    // Step 2: fnv mix (64 iterations)
+    //         for i in 0..8
+    //           for j in 0..64 (fnv iterations)
+    //               for k in 0..4
+    //                 Load sha3_512 from thread `i*8+k`, `32+i*8+k`
+    //                 32 threads work cooperatively to process 1 nonce (load 128-byte cache line at once)
+    //               Transpose mix to prepare for the reduction (see below)
+    //               Calculate cmix
+    // Step 3: sha3_256(s+cmix)
+    //         Each thread process 1 nonce
+    uint gid = gl_GlobalInvocationID.x;
+    uint th_ix = gl_LocalInvocationIndex;
+
+    uvec2 state[25];
+    state[0] = conf.g_header[0];
+    state[1] = conf.g_header[1];
+    state[2] = conf.g_header[2];
+    state[3] = conf.g_header[3];
+    state[4] = unpackUint2x32(conf.start_nonce + gid);
+    state[5] = unpackUint2x32(0x0000000000000001UL);
+    state[6] = uvec2(0);
+    state[7] = uvec2(0);
+    state[8] = unpackUint2x32(0x8000000000000000UL);
+    for (int i = 9; i < 25; ++i)
+        state[i] = uvec2(0);
+    uint stage = 0;
+    while (true) {
+        KECCAK_PROCESS(state, stage == 0 ? 5 : 12, stage == 0 ? 8 : 1);
+        if (stage == 1) break;
+        for (int i = 0; i < 8; i++) {
+            C2R_SCATTER(shuf_s, 16, 32, i*2, th_ix, state[i].x);
+            C2R_SCATTER(shuf_s, 16, 32, i*2+1, th_ix, state[i].y);
+        }
+        // <--------- 32 uint --------->
+        // +-------------+-------------+
+        // | hash 0      | hash 1      |
+        // +-------------+-------------+
+        // | hash 2      | hash 3      |
+        // +-------------+-------------+
+        // | ...         | ...         |
+        // +-------------+-------------+
+
+        barrier();
+
+#ifdef WAVE64
+        uvec2 s0[8][4]; // uniform, first 4 bytes of sha3_512
+#else
+        uint s0[8][4]; // uniform, first 4 bytes of sha3_512
+#endif
+        uint mix[8][4]; // 128 bytes, spread over 32 threads
+
+        for (int i = 0; i < 4; i++) {
+            for (int t = 0; t < 8; t++) {
+                mix[t][i] = C2R_GATHER(shuf_s, 16, 32, t*2+(i/2), bitfieldInsert(th_ix, i, 4, 1));
+            }
+        }
+        for (int i = 0; i < 4; i++) {
+            for (int t = 0; t < 8; t++) {
+#ifdef WAVE64
+                s0[t][i] = uvec2(subgroupBroadcastFirst(mix[t][i]), subgroupShuffle(mix[t][i], 32));
+#else
+                // s0[t][i] = subgroupShuffle(mix[t][i], 0);
+                s0[t][i] = subgroupBroadcastFirst(mix[t][i]);
+#endif
+            }
+        }
+        for (int i = 0; i < 64; i++) {
+            for (int j = 0; j < 4; j++) {
+                for (int t = 0; t < 8; t++) {
+                    // Step 1: calculate index into DAG
+                    // All done on SGPR
+#ifdef WAVE64
+                    uvec2 mix_i = uvec2(subgroupShuffle(mix[t][j], i % 32), subgroupShuffle(mix[t][j], i % 32 + 32));
+                    uvec2 p = fast_mod(fnv(i ^ s0[t][j], mix_i), conf.dag_size_mix_c, conf.dag_size_mix);
+                    uvec2 p_idx = p * 32;
+#else
+                    uint mix_i = subgroupShuffle(mix[t][j], i % 32);
+                    uint p = fast_mod(fnv(i ^ s0[t][j], mix_i), conf.dag_size_mix_c, conf.dag_size_mix);
+                    uint p_idx = p * 32;
+#endif
+                    // Step 2: load value from DAG
+                    // 1 VMEM cache line (128 bytes) at once
+#ifdef WAVE64
+                    uint buf_idx = ((th_ix & 32) == 0 ? p_idx.x : p_idx.y) + (th_ix % 32);
+#else
+                    uint buf_idx = p_idx + (th_ix % 32);
+#endif
+                    uint new_data = conf.dag_read.values[buf_idx];
+                    // Step 3: apply fnv and update mix
+                    mix[t][j] = fnv(mix[t][j], new_data);
+                }
+            }
+        }
+        for (int t = 0; t < 8; t++) {
+            for (int j = 0; j < 4; j++) {
+                R2C_SCATTER(shuf_mix, 4, 32, j, th_ix, mix[t][j]);
+            }
+            barrier();
+            for (int j = 0; j < 4; j++) {
+                mix[t][j] = R2C_GATHER(shuf_mix, 4, 32, j, th_ix);
+            }
+        }
+        for (int t = 0; t < 8; t++) {
+            uint cmix = fnv(fnv(fnv(mix[t][0], mix[t][1]), mix[t][2]), mix[t][3]);
+            // <--------------- 32 uint --------------->
+            // +---------+---------+---------+---------+
+            // | cmix 0  | cmix 1  | cmix 2  | cmix 3  |
+            // +---------+---------+---------+---------+
+            // | ...     | ...     | ...     | ...     |
+            // +---------+---------+---------+---------+
+            // | cmix 28 | cmix 29 | cmix 30 | cmix 31 |
+            // +---------+---------+---------+---------+
+            R2C_SCATTER(shuf_cmix, 8, 32, t, th_ix, cmix);
+        }
+
+        barrier();
+
+        // Technically not necessary, but with this the state values can be paged out during the mix phase saving VGPRs
+        for (int i = 0; i < 8; i++) {
+             state[i].x = R2C_GATHER(shuf_s, 16, 32, i*2, th_ix);
+             state[i].y = R2C_GATHER(shuf_s, 16, 32, i*2+1, th_ix);
+        }
+        for (int t = 0; t < 4; t++) {
+            state[8+t].x = R2C_GATHER(shuf_cmix, 8, 32, t*2, th_ix);
+            state[8+t].y = R2C_GATHER(shuf_cmix, 8, 32, t*2+1, th_ix);
+        }
+        state[12] = unpackUint2x32(0x0000000000000001UL);
+        state[13] = uvec2(0);
+        state[14] = uvec2(0);
+        state[15] = uvec2(0);
+        state[16] = unpackUint2x32(0x8000000000000000UL);
+        for (int i = 17; i < 25; ++i)
+            state[i] = uvec2(0);
+        stage = 1;
+        // DISABLE_UNROLL(stage);
+    }
+    // KECCAK_PROCESS(state, 12, 1);
+
+    if (packUint2x32(bswap64(state[0])) <= conf.target) {
+        uint slot = min(OUTPUT_ENTRY_COUNT - 1u, atomicAdd(out_.output_count, 1));
+        out_.outputs[slot].gid = gid;
+        for (int t = 0; t < 8; t++) {
+            out_.outputs[slot].mix[t] = R2C_GATHER(shuf_cmix, 8, 32, t, th_ix);
+        }
+    }
+}
+

@@ -1,0 +1,89 @@
+// Copyright 2021 Tatsuyuki Ishi <ishitatsuyuki@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+#version 450
+layout(local_size_x = 64) in; /* AMD(R) optimized */
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_buffer_reference : require
+
+#include "hash.h"
+#include "struct.h"
+#include "transpose.h"
+#include "util.h"
+
+layout(push_constant) uniform PushConstants {
+    Config conf;
+};
+layout(set = 0, binding = 0) readonly buffer Light {
+    uint[] light;
+};
+
+void SHA3_512(inout uvec2[8] s)
+{
+    uvec2 st[25];
+
+    for (int i = 0; i < 8; i++)
+        st[i] = s[i];
+
+    st[8] = uvec2(0x00000001, 0x80000000);
+
+    for (int i = 9; i != 25; i++)
+        st[i] = uvec2(0);
+
+    KECCAK_PROCESS(st, 8, 8);
+
+    for (int i = 0; i < 8; i++)
+        s[i] = st[i];
+}
+
+shared uint shuf_final[16][gl_WorkGroupSize];
+shared uint mix[16][gl_WorkGroupSize];
+
+void main() {
+    uvec2 sha[8];
+    uint ix = uint(conf.start_nonce) + gl_GlobalInvocationID.x;
+    uint th_ix = gl_LocalInvocationIndex;
+    uint cache_idx = fast_mod(ix, conf.light_size_c, conf.light_size);
+    for (int i = 0; i < 8; i++) {
+        sha[i].x = light[cache_idx * 16 + i * 2];
+        sha[i].y = light[cache_idx * 16 + i * 2 + 1];
+    }
+    sha[0].x ^= ix;
+    SHA3_512(sha);
+    for (int i = 0; i < 8; i++) {
+        mix[i * 2][th_ix] = sha[i].x;
+        mix[i * 2 + 1][th_ix] = sha[i].y;
+    }
+    for (int j = 0; j < 256; j++) {
+        uint cache_idx = fast_mod(fnv(ix ^ j, mix[j % 16][th_ix]), conf.light_size_c, conf.light_size);
+        for (int i = 0; i < 16; i++) {
+            mix[i][th_ix] = fnv(mix[i][th_ix], light[cache_idx * 16 + i]);
+        }
+    }
+    for (int i = 0; i < 8; i++) {
+        sha[i].x = mix[i * 2][th_ix];
+        sha[i].y = mix[i * 2 + 1][th_ix];
+    }
+    SHA3_512(sha);
+    for (int i = 0; i < 8; i++) {
+        C2R_SCATTER(shuf_final, 16, 64, i * 2, th_ix, sha[i].x);
+        C2R_SCATTER(shuf_final, 16, 64, i * 2 + 1, th_ix, sha[i].y);
+    }
+    barrier();
+    for (int i = 0; i < 16; i++) {
+        uint word0 = C2R_GATHER(shuf_final, 16, 64, i, th_ix);
+        // We are going to write 64 hashes, 4 hashes per iteration.
+        // 64 hashes would be 64 * 16 = 1024 uints.
+        uint start = uint(conf.start_nonce) + gl_WorkGroupID.x * 64 + i * 4; // The index of the first written hash
+        conf.dag_write.values[start * 16 + th_ix] = word0;
+    }
+}
