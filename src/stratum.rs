@@ -173,6 +173,7 @@ impl ClientInner {
                 }}
                 val = &mut stop => {
                     val.unwrap();
+                    submissions.close();
                     while let Some((job_id, nonce_hex)) = submissions.recv().await {
                         self.submit(&job_id, &nonce_hex).await.unwrap();
                     }
