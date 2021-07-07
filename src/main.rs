@@ -268,7 +268,7 @@ fn main() -> std::io::Result<()> {
 A large value increases efficiency, but also increases latency (therefore increasing the risk of stale shares) and might make the system less responsive as well.
 Popular wisdoms say that this should be a multiple of your CU count.")
                 .validator(|s| s.parse::<u64>())
-                .default_value("28800")
+                .default_value("5760")
         )
         .arg(
             clap::Arg::new("buffers")
