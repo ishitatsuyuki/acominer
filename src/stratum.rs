@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
-use std::thread::{JoinHandle};
+use std::thread::JoinHandle;
+use std::time::Instant;
 
 use byteorder::{BigEndian, ByteOrder};
 use serde_derive::{Deserialize, Serialize};
@@ -35,8 +36,9 @@ pub struct Response {
     pub id: Value,
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct JobInfo {
+    pub received: Instant,
     pub difficulty: u64,
     pub extra_nonce: u64,
     pub pool_nonce_bytes: usize,
@@ -48,7 +50,7 @@ pub struct JobInfo {
 pub struct StratumClient {
     thread: Option<JoinHandle<()>>,
     current_job: Arc<Mutex<JobInfo>>,
-    submissions: mpsc::Sender<(String, String)>,
+    submissions: mpsc::Sender<(String, String, Instant)>,
     stop: Option<oneshot::Sender<()>>,
 }
 
@@ -65,8 +67,13 @@ impl StratumClient {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all()
             .build()?;
         let current_job = Arc::new(Mutex::new(JobInfo {
+            received: Instant::now(),
             difficulty: 0x00000000FFFF0000,
-            ..Default::default()
+            extra_nonce: 0,
+            pool_nonce_bytes: 0,
+            job_id: "".to_string(),
+            seed_hash: vec![],
+            header_hash: vec![],
         }));
         let mut inner = rt.block_on(Self::new_impl(target, current_job.clone(), user_agent, username, password))?;
         let (stop_tx, stop_rx) = oneshot::channel();
@@ -100,11 +107,11 @@ impl StratumClient {
         Ok(inner)
     }
 
-    pub fn submit(&mut self, job_id: String, nonce: u64, pool_nonce_bytes: usize) {
+    pub fn submit(&mut self, job: &JobInfo, nonce: u64) {
         let mut buf = [0; 8];
         BigEndian::write_u64(&mut buf, nonce);
-        let nonce_hex = hex::encode(&buf[pool_nonce_bytes..]);
-        self.submissions.try_send((job_id, nonce_hex)).unwrap();
+        let nonce_hex = hex::encode(&buf[job.pool_nonce_bytes..]);
+        self.submissions.try_send((job.job_id.clone(), nonce_hex, job.received.clone())).unwrap();
     }
 
     pub fn current_job(&self) -> JobInfo {
@@ -144,6 +151,7 @@ impl ClientInner {
                     job.job_id = job_id;
                     job.seed_hash = seed_hash;
                     job.header_hash = header_hash;
+                    job.received = Instant::now();
                 }
                 _ => unimplemented!(),
             }
@@ -164,18 +172,18 @@ impl ClientInner {
         }
     }
 
-    async fn worker(&mut self, mut submissions: mpsc::Receiver<(String, String)>, mut stop: oneshot::Receiver<()>) {
+    async fn worker(&mut self, mut submissions: mpsc::Receiver<(String, String, Instant)>, mut stop: oneshot::Receiver<()>) {
         loop {
             tokio::select! {
                 val = self.handle_notification() => { assert!(val.unwrap().is_none()); }
-                val = submissions.recv() => { if let Some((job_id, nonce_hex)) = val {
-                    self.submit(&job_id, &nonce_hex).await.unwrap();
+                val = submissions.recv() => { if let Some((job_id, nonce_hex, ts)) = val {
+                    self.submit(&job_id, &nonce_hex, ts).await.unwrap();
                 }}
                 val = &mut stop => {
                     val.unwrap();
                     submissions.close();
-                    while let Some((job_id, nonce_hex)) = submissions.recv().await {
-                        self.submit(&job_id, &nonce_hex).await.unwrap();
+                    while let Some((job_id, nonce_hex, ts)) = submissions.recv().await {
+                        self.submit(&job_id, &nonce_hex, ts).await.unwrap();
                     }
                     return;
                 }
@@ -228,7 +236,7 @@ impl ClientInner {
         Ok(())
     }
 
-    async fn submit(&mut self, job_id: &str, nonce_hex: &str) -> std::io::Result<()> {
+    async fn submit(&mut self, job_id: &str, nonce_hex: &str, received_ts: Instant) -> std::io::Result<()> {
         let submit = Request {
             method: "mining.submit".into(),
             params: vec![
@@ -236,10 +244,11 @@ impl ClientInner {
             ],
             id: self.req_id.into(),
         };
+        let before_send = Instant::now();
         let res = self.request(submit).await?;
         let result = res.result.unwrap().as_bool().unwrap();
         if result {
-            println!("Share submitted");
+            println!("Share accepted. ping: {:?}, total latency: {:?}", before_send.elapsed(), received_ts.elapsed());
         } else {
             println!("Share rejected: {:?}", res.error);
         }

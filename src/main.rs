@@ -358,7 +358,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                 future.wait(None).unwrap();
                 let output_buf = pipeline.search[current_pipeline].output_buf.read().unwrap();
                 for i in 0..output_buf.output_count {
-                    client.submit(job.job_id.clone(), start_nonce + output_buf.outputs[i as usize].gid as u64, job.pool_nonce_bytes);
+                    client.submit(&job, start_nonce + output_buf.outputs[i as usize].gid as u64);
                 }
             }
             let job = client.current_job();
