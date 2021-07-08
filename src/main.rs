@@ -9,6 +9,7 @@
 use std::convert::TryInto;
 use std::num::ParseIntError;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use byteorder::{ByteOrder, LittleEndian};
@@ -231,6 +232,18 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
 }
 
 fn main() -> std::io::Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    ctrlc::set_handler({
+        let stop = stop.clone();
+        move || {
+            if !stop.swap(true, Ordering::SeqCst) {
+                println!("Ctrl+C received, shutting down...");
+            } else {
+                println!("Ctrl+C pressed twice, force exiting.");
+                std::process::exit(130);
+            }
+        }
+    }).unwrap();
     let app_info = ApplicationInfo {
         application_name: Some(env!("CARGO_PKG_NAME").into()),
         application_version: Some(Version {
@@ -328,76 +341,75 @@ Popular wisdoms say that this should be a multiple of your CU count.")
     let subgroup_size: u32 = app.value_of_t("subgroup size").unwrap_or_else(|_| physical.properties().subgroup_size.unwrap());
     println!("Using subgroup size: {}", subgroup_size);
 
-    let job = client.current_job();
-    let mut pipeline = build_pipeline(device.clone(), queue.clone(), queue_family, &job.seed_hash, pipeline_count, subgroup_size);
-    let mut current_seed_hash = job.seed_hash;
     let mut nonce: u64 = rand::random();
     let wg_count: u64 = app.value_of_t("workgroups").unwrap();
     let hash_quantum = wg_count * subgroup_size as u64;
-    let mut hash_counter = 0u64;
-    let mut start_time = Instant::now();
-    let mut current_pipeline = 0;
-    let mut futures: Vec<Option<(FenceSignalFuture<_>, u64, JobInfo)>> = (0..pipeline_count).map(|_| None).collect();
-    let mut cleanup_counter = 0;
-    loop {
-        if let Some((future, start_nonce, job)) = futures[current_pipeline].take() {
-            future.wait(None).unwrap();
-            let output_buf = pipeline.search[current_pipeline].output_buf.read().unwrap();
-            for i in 0..output_buf.output_count {
-                client.submit(job.job_id.clone(), start_nonce + output_buf.outputs[i as usize].gid as u64, job.pool_nonce_bytes);
-            }
-        }
+    while !stop.load(Ordering::SeqCst) {
         let job = client.current_job();
-        if job.seed_hash != current_seed_hash
-        {
-            cleanup_counter += 1;
-            if cleanup_counter != pipeline_count {
-                current_pipeline = (current_pipeline + 1) % pipeline_count;
-                continue;
-            } else {
-                cleanup_counter = 0;
+        let mut pipeline = build_pipeline(device.clone(), queue.clone(), queue_family, &job.seed_hash, pipeline_count, subgroup_size);
+        let current_seed_hash = job.seed_hash;
+        let mut hash_counter = 0u64;
+        let mut start_time = Instant::now();
+        let mut current_pipeline = 0;
+        let mut futures: Vec<Option<(FenceSignalFuture<_>, u64, JobInfo)>> = (0..pipeline_count).map(|_| None).collect();
+        let mut cleanup_counter = 0;
+        loop {
+            if let Some((future, start_nonce, job)) = futures[current_pipeline].take() {
+                future.wait(None).unwrap();
+                let output_buf = pipeline.search[current_pipeline].output_buf.read().unwrap();
+                for i in 0..output_buf.output_count {
+                    client.submit(job.job_id.clone(), start_nonce + output_buf.outputs[i as usize].gid as u64, job.pool_nonce_bytes);
+                }
             }
-            println!("epoch changed, DAG rebuilding...");
-            drop(pipeline);
-            pipeline = build_pipeline(device.clone(), queue.clone(), queue_family, &job.seed_hash, pipeline_count, subgroup_size);
-            current_seed_hash = job.seed_hash.clone();
-        }
-        let nonce_mask = (!0u64) >> (job.pool_nonce_bytes * 8);
-        if ((nonce + hash_quantum) & nonce_mask) < hash_quantum { // Wraparound
-            nonce = 0;
-        }
+            let job = client.current_job();
+            if stop.load(Ordering::SeqCst) || job.seed_hash != current_seed_hash
+            {
+                cleanup_counter += 1;
+                if cleanup_counter != pipeline_count {
+                    current_pipeline = (current_pipeline + 1) % pipeline_count;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            let nonce_mask = (!0u64) >> (job.pool_nonce_bytes * 8);
+            if ((nonce + hash_quantum) & nonce_mask) < hash_quantum { // Wraparound
+                nonce = 0;
+            }
 
-        pipeline.config.start_nonce = job.extra_nonce | (nonce & nonce_mask);
-        pipeline.search[current_pipeline].output_buf.write().unwrap().output_count = 0;
-        for i in 0..4 {
-            let mut target = [0; 2];
-            LittleEndian::read_u32_into(&job.header_hash[i * 8..i * 8 + 8], &mut target);
-            pipeline.config.g_header[i] = target;
+            pipeline.config.start_nonce = job.extra_nonce | (nonce & nonce_mask);
+            pipeline.search[current_pipeline].output_buf.write().unwrap().output_count = 0;
+            for i in 0..4 {
+                let mut target = [0; 2];
+                LittleEndian::read_u32_into(&job.header_hash[i * 8..i * 8 + 8], &mut target);
+                pipeline.config.g_header[i] = target;
+            }
+            pipeline.config.target = job.difficulty;
+
+            let mut builder = AutoCommandBufferBuilder::primary(
+                device.clone(),
+                queue_family,
+                CommandBufferUsage::OneTimeSubmit,
+            ).unwrap();
+            builder.dispatch([wg_count as _, 1, 1], pipeline.search[current_pipeline].pipeline.clone(), pipeline.search[current_pipeline].set.clone(), dag_cs::ty::PushConstants { conf: pipeline.config }, vec![]).unwrap();
+            let command_buffer = builder.build().unwrap();
+
+            let future = sync::now(device.clone())
+                .then_execute(queue.clone(), command_buffer)
+                .unwrap()
+                .then_signal_fence_and_flush()
+                .unwrap();
+            futures[current_pipeline] = Some((future, pipeline.config.start_nonce, job.clone()));
+
+            nonce += hash_quantum;
+            hash_counter += hash_quantum;
+            if start_time.elapsed() > Duration::from_secs(5) {
+                println!("{:.02} MH/s", hash_counter as f64 / start_time.elapsed().as_secs_f64() / 1000. / 1000.);
+                start_time = Instant::now();
+                hash_counter = 0;
+            }
+            current_pipeline = (current_pipeline + 1) % pipeline_count;
         }
-        pipeline.config.target = job.difficulty;
-
-        let mut builder = AutoCommandBufferBuilder::primary(
-            device.clone(),
-            queue_family,
-            CommandBufferUsage::OneTimeSubmit,
-        ).unwrap();
-        builder.dispatch([wg_count as _, 1, 1], pipeline.search[current_pipeline].pipeline.clone(), pipeline.search[current_pipeline].set.clone(), dag_cs::ty::PushConstants { conf: pipeline.config }, vec![]).unwrap();
-        let command_buffer = builder.build().unwrap();
-
-        let future = sync::now(device.clone())
-            .then_execute(queue.clone(), command_buffer)
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap();
-        futures[current_pipeline] = Some((future, pipeline.config.start_nonce, job.clone()));
-
-        nonce += hash_quantum;
-        hash_counter += hash_quantum;
-        if start_time.elapsed() > Duration::from_secs(5) {
-            println!("{:.02} MH/s", hash_counter as f64 / start_time.elapsed().as_secs_f64() / 1000. / 1000.);
-            start_time = Instant::now();
-            hash_counter = 0;
-        }
-        current_pipeline = (current_pipeline + 1) % pipeline_count;
     }
+    Ok(())
 }
