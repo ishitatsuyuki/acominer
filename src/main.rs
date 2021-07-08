@@ -277,7 +277,7 @@ fn main() -> std::io::Result<()> {
                 .short('w')
                 .long("workgroups")
                 .about("Workgroup count")
-                .long_about(r"Specify the amount of work to launch at once to the GPU.
+                .long_about(r"Specify the amount of work to launch at once to the GPU, in number of threads divided by 64.
 A large value increases efficiency, but also increases latency (therefore increasing the risk of stale shares) and might make the system less responsive as well.
 Popular wisdoms say that this should be a multiple of your CU count.")
                 .validator(|s| s.parse::<u64>())
@@ -342,7 +342,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
     println!("Using subgroup size: {}", subgroup_size);
 
     let mut nonce: u64 = rand::random();
-    let wg_count: u64 = app.value_of_t("workgroups").unwrap();
+    let wg_count = app.value_of_t::<u64>("workgroups").unwrap() * 64 / subgroup_size as u64;
     let hash_quantum = wg_count * subgroup_size as u64;
     while !stop.load(Ordering::SeqCst) {
         let job = client.current_job();
