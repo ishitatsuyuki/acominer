@@ -25,7 +25,7 @@ use vulkano::instance::{ApplicationInfo, DriverId, Instance, InstanceExtensions,
 use vulkano::pipeline::ComputePipeline;
 use vulkano::pipeline::ComputePipelineAbstract;
 use vulkano::sync;
-use vulkano::sync::{FenceSignalFuture, GpuFuture};
+use vulkano::sync::{Fence, FenceSignalFuture, FenceWaitError, GpuFuture};
 use vulkano::Version;
 
 use crate::cache::{epoch_from_seed_hash, get_cache_size, get_full_size, get_seed_hash, make_cache};
@@ -298,6 +298,13 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                 .takes_value(true)
                 .long_about("Control the subgroup size to be used on RDNA or later. On Mesa drivers, this defaults to 64.")
         )
+        .arg(
+            clap::Arg::new("target hashrate")
+                .long("target-hashrate")
+                .about("Target hashrate for latency reduction")
+                .takes_value(true)
+                .long_about("Set a target hashrate (hash/second) to pace work submission, reducing buffering and latency.")
+        )
         .get_matches();
     let url: Url = app.value_of_t("pool").unwrap();
     let mut client = StratumClient::new(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")), &*url.socket_addrs(|| Some(4444)).unwrap(), url.username(), url.password().unwrap_or("X"))?;
@@ -344,6 +351,14 @@ Popular wisdoms say that this should be a multiple of your CU count.")
     let mut nonce: u64 = rand::random();
     let wg_count = app.value_of_t::<u64>("workgroups").unwrap() * 64 / subgroup_size as u64;
     let hash_quantum = wg_count * subgroup_size as u64;
+
+    let target_hashrate: Option<u64> = app.value_of_t("target hashrate").ok();
+    let pacing = target_hashrate.map(|x| {
+        Duration::from_secs_f64(hash_quantum as f64 / x as f64)
+    });
+    if let Some(pace) = pacing {
+        println!("Using pacing: {:?} per submission", pace);
+    }
     while !stop.load(Ordering::SeqCst) {
         let job = client.current_job();
         let mut pipeline = build_pipeline(device.clone(), queue.clone(), queue_family, &job.seed_hash, pipeline_count, subgroup_size);
@@ -353,12 +368,42 @@ Popular wisdoms say that this should be a multiple of your CU count.")
         let mut current_pipeline = 0;
         let mut futures: Vec<Option<(FenceSignalFuture<_>, u64, JobInfo)>> = (0..pipeline_count).map(|_| None).collect();
         let mut cleanup_counter = 0;
+        let mut last_time = Instant::now();
         loop {
-            if let Some((future, start_nonce, job)) = futures[current_pipeline].take() {
+            let target = pacing.map(|pacing| {
+                let now = Instant::now();
+                let target = (last_time + pacing).max(now);
+                last_time = target;
+                target
+            });
+            if let Some((future, ..)) = futures[current_pipeline].as_ref() {
                 future.wait(None).unwrap();
-                let output_buf = pipeline.search[current_pipeline].output_buf.read().unwrap();
-                for i in 0..output_buf.output_count {
-                    client.submit(&job, start_nonce + output_buf.outputs[i as usize].gid as u64);
+            }
+            loop {
+                for i in 0..pipeline_count {
+                    if let Some((future, start_nonce, job)) = futures[i].as_mut() {
+                        if future.get_fence().map(|x| x.ready().unwrap()).unwrap_or(true) {
+                            future.wait(None).unwrap();
+                            let output_buf = pipeline.search[i].output_buf.read().unwrap();
+                            for i in 0..output_buf.output_count {
+                                client.submit(&job, *start_nonce + output_buf.outputs[i as usize].gid as u64);
+                            }
+                            futures[i] = None;
+                        }
+                    }
+                }
+                let wait: Vec<_> = futures.iter_mut().filter_map(|x| x.as_mut().and_then(|x| x.0.get_fence())).map(|x| &*x).collect();
+                if !wait.is_empty() {
+                    match Fence::multi_wait(wait, target.map(|t| t.saturating_duration_since(Instant::now())), false) {
+                        Ok(..) => {}
+                        Err(FenceWaitError::Timeout) => { break; }
+                        Err(x) => panic!("error waiting for fence: {}", x),
+                    }
+                } else {
+                    if let Some(target) = target {
+                        std::thread::sleep(target.saturating_duration_since(Instant::now()));
+                    }
+                    break;
                 }
             }
             let job = client.current_job();
@@ -399,6 +444,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                 .unwrap()
                 .then_signal_fence_and_flush()
                 .unwrap();
+            assert!(futures[current_pipeline].is_none());
             futures[current_pipeline] = Some((future, pipeline.config.start_nonce, job.clone()));
 
             nonce += hash_quantum;
