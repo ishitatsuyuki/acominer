@@ -4,8 +4,7 @@ An experimental ETH miner powered by Vulkan.
 
 ## IMPORTANT
 
-acominer requires an AMD graphics card running Linux and **a patched driver** to run. Follow the instructions below to
-install a modified Mesa branch to your machine.
+acominer requires an AMD graphics card running Linux to run.
 
 **acominer does not support other setups.**
 
@@ -17,20 +16,17 @@ You need the Meson build system and ninja installed along with C/C++ compilers. 
 ```shell
 git clone -b acominer https://gitlab.freedesktop.org/ishitatsuyuki/mesa.git # Clone the Mesa fork
 cd mesa
-meson build # Generate build files
+meson build -Ddri-drivers= -Dgallium-drivers=radeonsi -Dvulkan-drivers=amd -Dprefix=$PWD/build/install # Generate build files
 cd build
 ninja # Run the build
-sudo ninja install # Install built drivers
+ninja install # Copy built drivers to prefix
 ```
 
 Override the Vulkan driver as follows (every time) when you run acominer.
 
 ```shell
-export VK_ICD_FILENAMES=/usr/local/share/vulkan/icd.d/radeon_icd.x86_64.json
+export VK_ICD_FILENAMES=/path/to/mesa/build/install/share/vulkan/icd.d/radeon_icd.x86_64.json
 ```
-
-If you ever need to remove the modified Mesa drivers from your system, run `sudo ninja uninstall` in the `build`
-directory.
 
 ## Building
 
