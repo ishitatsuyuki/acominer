@@ -158,11 +158,6 @@ void main() {
 
         barrier();
 
-        // Technically not necessary, but with this the state values can be paged out during the mix phase saving VGPRs
-        for (int i = 0; i < 8; i++) {
-             state[i].x = R2C_GATHER(shuf_s, 16, 32, i*2, th_ix);
-             state[i].y = R2C_GATHER(shuf_s, 16, 32, i*2+1, th_ix);
-        }
         for (int t = 0; t < 4; t++) {
             state[8+t].x = R2C_GATHER(shuf_cmix, 8, 32, t*2, th_ix);
             state[8+t].y = R2C_GATHER(shuf_cmix, 8, 32, t*2+1, th_ix);
