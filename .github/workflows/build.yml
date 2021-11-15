@@ -1,0 +1,81 @@
+on: [push, pull_request]
+
+name: Build release artifacts
+
+jobs:
+  build:
+    name: Build mesa and acominer
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      CC: "sccache cc"
+      CXX: "sccache c++"
+    steps:
+      - name: Prepare sccache
+        uses: actions/cache@v2
+        continue-on-error: false
+        with:
+          path: /home/runner/.cache/sccache
+          key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-
+      - run: |
+          sudo sed -i -- 's/# deb-src/deb-src/g' /etc/apt/sources.list
+          sudo apt update
+          sudo apt build-dep libdrm mesa -y
+          sudo apt install cmake -y
+      - name: Install sccache
+        env:
+          LINK: https://github.com/mozilla/sccache/releases/download
+          SCCACHE_VERSION: 0.2.15
+        run: |
+          SCCACHE_FILE=sccache-v$SCCACHE_VERSION-x86_64-unknown-linux-musl
+          mkdir -p $HOME/.local/bin
+          curl -L "$LINK/v$SCCACHE_VERSION/$SCCACHE_FILE.tar.gz" | tar xz
+          mv -f $SCCACHE_FILE/sccache $HOME/.local/bin/sccache
+          chmod +x $HOME/.local/bin/sccache
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - name: Start sccache server
+        run: sccache --start-server
+      - uses: actions/checkout@v2
+      - run: git clone https://gitlab.freedesktop.org/ishitatsuyuki/mesa.git -b acominer --depth 1
+      - run: |
+          cd mesa
+          sudo bash ./.gitlab-ci/container/build-libdrm.sh
+          meson build -Ddri-drivers= -Dgallium-drivers= -Dvulkan-drivers=amd -Dllvm=disabled -Dprefix=$PWD/build/install
+          cd build
+          ninja
+          ninja install
+          TMP=$(mktemp)
+          jq '.ICD.library_path = "../../../lib/x86_64-linux-gnu/libvulkan_radeon.so"' install/share/vulkan/icd.d/radeon_icd.x86_64.json > "$TMP"
+          mv "$TMP" install/share/vulkan/icd.d/radeon_icd.x86_64.json
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release
+      - name: Print sccache stats
+        run: sccache --show-stats
+      - name: Stop sccache server
+        run: sccache --stop-server || true
+      - run: |
+          install -d dist
+          mv mesa/build/install dist/mesa
+          install target/release/acominer dist/
+          install ci/run.sh dist/
+          tar Jcvf acominer-linux-amd64.tar.xz -C dist .
+      - name: 'Upload Artifact'
+        uses: actions/upload-artifact@v2
+        with:
+          name: binaries
+          path: acominer-linux-amd64.tar.xz
+      - name: 'Create Release'
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: acominer-linux-amd64.tar.xz
+
