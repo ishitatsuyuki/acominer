@@ -400,7 +400,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                 }
                 let wait: Vec<_> = futures.iter_mut().filter_map(|x| x.as_mut().and_then(|x| x.0.get_fence())).map(|x| &*x).collect();
                 if !wait.is_empty() {
-                    match Fence::multi_wait(wait, target.map(|t| t.saturating_duration_since(Instant::now())), false) {
+                    match Fence::multi_wait(wait, target.map(|t| t.saturating_duration_since(Instant::now())).or(Some(Duration::ZERO)), false) {
                         Ok(..) => {}
                         Err(FenceWaitError::Timeout) => { break; }
                         Err(x) => panic!("error waiting for fence: {}", x),
