@@ -8,32 +8,17 @@ acominer requires an AMD graphics card running Linux to run.
 
 **acominer does not support other setups.**
 
-### Installing the modified Mesa branch
+## Running
 
-You need the Meson build system and ninja installed along with C/C++ compilers. See
-[Mesa Documentation](https://docs.mesa3d.org/install.html) for a list of dependencies.
+Binaries are available from [releases](https://github.com/ishitatsuyuki/acominer/releases). Ubuntu 20.04 or later is supported.
 
-```shell
-git clone -b acominer https://gitlab.freedesktop.org/ishitatsuyuki/mesa.git # Clone the Mesa fork
-cd mesa
-meson build -Ddri-drivers= -Dgallium-drivers=radeonsi -Dvulkan-drivers=amd -Dprefix=$PWD/build/install # Generate build files
-cd build
-ninja # Run the build
-ninja install # Copy built drivers to prefix
+If you are running a headless Ubuntu-based setup, make sure `vulkan-utils libvulkan1 libxcb-shm0` is installed.
+
+Download, extract and execute `./run.sh`. See also [Usage](#Usage).
+
 ```
-
-Override the Vulkan driver as follows (every time) when you run acominer.
-
-```shell
-export VK_ICD_FILENAMES=/path/to/mesa/build/install/share/vulkan/icd.d/radeon_icd.x86_64.json
+./run.sh stratum://0x1234567890123456789012345678901234567890.Worker:password@pool.example.com:4444
 ```
-
-## Building
-
-In addition to the Rust compiler, acominer needs Vulkan SDK to build. See
-[here](https://github.com/vulkano-rs/vulkano#linux-specific-setup) for distro specific instructions.
-
-Afterwards, just run `cargo build --release` and you should get a working binary as `target/release/acominer`.
 
 ## Usage
 
@@ -53,6 +38,35 @@ If acominers fails with "device out of memory", then you need to override the Vu
 - Zero mining fee
 - Minimal interference with graphics workload through the use of async compute
 - Dependencies kept to a small amount to make audit easy
+
+## Building
+
+### Building the Mesa fork
+
+You need the Meson build system and ninja installed along with C/C++ compilers. See
+[Mesa Documentation](https://docs.mesa3d.org/install.html) for a list of dependencies.
+
+```shell
+git clone -b acominer https://gitlab.freedesktop.org/ishitatsuyuki/mesa.git # Clone the Mesa fork
+cd mesa
+meson build -Ddri-drivers= -Dgallium-drivers= -Dvulkan-drivers=amd -Dprefix=$PWD/build/install # Generate build files
+cd build
+ninja # Run the build
+ninja install # Copy built drivers to prefix
+```
+
+Override the Vulkan driver as follows (every time) when you run acominer.
+
+```shell
+export VK_ICD_FILENAMES=/path/to/mesa/build/install/share/vulkan/icd.d/radeon_icd.x86_64.json
+```
+
+### Building the project
+
+In addition to the Rust compiler, acominer needs Vulkan SDK to build. See
+[here](https://github.com/vulkano-rs/vulkano#linux-specific-setup) for distro specific instructions.
+
+Afterwards, just run `cargo build --release` and you should get a working binary as `target/release/acominer`.
 
 ## License
 
