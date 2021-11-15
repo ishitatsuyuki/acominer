@@ -2,13 +2,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use backoff::backoff::Backoff;
+use backoff::ExponentialBackoff;
 use byteorder::{BigEndian, ByteOrder};
 use serde_derive::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::io::{BufReader, BufWriter};
-use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -59,11 +61,15 @@ struct ClientInner {
     rx: BufReader<OwnedReadHalf>,
     tx: BufWriter<OwnedWriteHalf>,
     current_job: Arc<Mutex<JobInfo>>,
+    user_agent: String,
+    hostname: String,
+    port: u16,
     username: String,
+    password: String,
 }
 
 impl StratumClient {
-    pub fn new(user_agent: &str, target: impl ToSocketAddrs, username: &str, password: &str) -> std::io::Result<StratumClient> {
+    pub fn new(user_agent: &str, hostname: &str, port: u16, username: &str, password: &str) -> anyhow::Result<StratumClient> {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all()
             .build()?;
         let current_job = Arc::new(Mutex::new(JobInfo {
@@ -75,7 +81,7 @@ impl StratumClient {
             seed_hash: vec![],
             header_hash: vec![],
         }));
-        let mut inner = rt.block_on(Self::new_impl(target, current_job.clone(), user_agent, username, password))?;
+        let mut inner = rt.block_on(Self::new_impl(hostname, port, current_job.clone(), user_agent, username, password))?;
         let (stop_tx, stop_rx) = oneshot::channel();
         let (submissions_tx, submissions_rx) = mpsc::channel(16);
 
@@ -92,17 +98,27 @@ impl StratumClient {
         })
     }
 
-    async fn new_impl(target: impl ToSocketAddrs, current_job: Arc<Mutex<JobInfo>>, user_agent: &str, username: &str, password: &str)
-                      -> std::io::Result<ClientInner> {
-        let conn = TcpStream::connect(target).await?;
+    async fn new_impl(hostname: &str, port: u16, current_job: Arc<Mutex<JobInfo>>, user_agent: &str, username: &str, password: &str)
+                      -> anyhow::Result<ClientInner> {
+        let conn = TcpStream::connect((hostname, port)).await?;
         conn.set_nodelay(true)?;
         let (rx, tx) = conn.into_split();
         let rx = BufReader::new(rx);
         let tx = BufWriter::new(tx);
-        let mut inner = ClientInner { rx, tx, req_id: 0, current_job, username: username.to_owned() };
-        inner.connect(user_agent, username, password).await?;
+        let mut inner = ClientInner {
+            rx,
+            tx,
+            req_id: 0,
+            current_job,
+            user_agent: user_agent.to_owned(),
+            username: username.to_owned(),
+            password: password.to_owned(),
+            hostname: hostname.to_owned(),
+            port,
+        };
+        inner.connect(None).await?;
         while inner.current_job.lock().unwrap().seed_hash.is_empty() {
-            assert!(inner.handle_notification().await?.is_none());
+            assert!(inner.handle_notification(None).await?.is_none());
         }
         Ok(inner)
     }
@@ -130,13 +146,18 @@ impl Drop for StratumClient {
 impl ClientInner {
     // Handle server side messages; return None if the message was processed, return the response
     // if the message was a response to a client request.
-    async fn handle_notification(&mut self) -> std::io::Result<Option<Response>> {
+    async fn handle_notification(&mut self, lock: Option<&mut JobInfo>) -> anyhow::Result<Option<Response>> {
         let mut buf = vec![];
         let _count = self.rx.read_until(b'\n', &mut buf).await?;
 
         if let Ok(req) = serde_json::from_slice::<Request>(&buf[..buf.len() - 1]) {
-            let mut job = self.current_job.lock().unwrap();
-            assert!(req.id.is_null());
+            let clone = self.current_job.clone();
+            let mut local_lock = None;
+            let mut job = lock.unwrap_or_else(|| {
+                local_lock = Some(clone.lock().unwrap());
+                local_lock.as_mut().unwrap()
+            });
+            anyhow::ensure!(req.id.is_null());
             match &*req.method {
                 "mining.set_difficulty" => {
                     // Flawed, but works
@@ -145,8 +166,8 @@ impl ClientInner {
                 }
                 "mining.notify" => {
                     let job_id = req.params[0].as_str().unwrap().to_owned();
-                    let seed_hash = hex::decode(req.params[1].as_str().unwrap()).unwrap();
-                    let header_hash = hex::decode(req.params[2].as_str().unwrap()).unwrap();
+                    let seed_hash = hex::decode(req.params[1].as_str().unwrap())?;
+                    let header_hash = hex::decode(req.params[2].as_str().unwrap())?;
                     // clean_jobs is unimplemented
                     job.job_id = job_id;
                     job.seed_hash = seed_hash;
@@ -157,15 +178,15 @@ impl ClientInner {
             }
             Ok(None)
         } else {
-            let resp: Response = serde_json::from_slice(&buf[..buf.len() - 1]).unwrap(); // TODO: error handling
+            let resp: Response = serde_json::from_slice(&buf[..buf.len() - 1])?;
             Ok(Some(resp))
         }
     }
 
     /// Block until a response is received.
-    async fn get_response(&mut self) -> std::io::Result<Response> {
+    async fn get_response(&mut self, mut lock: Option<&mut JobInfo>) -> anyhow::Result<Response> {
         loop {
-            let res = self.handle_notification().await?;
+            let res = self.handle_notification(lock.as_deref_mut()).await?;
             if let Some(res) = res {
                 return Ok(res);
             }
@@ -175,15 +196,38 @@ impl ClientInner {
     async fn worker(&mut self, mut submissions: mpsc::Receiver<(String, String, Instant)>, mut stop: oneshot::Receiver<()>) {
         loop {
             tokio::select! {
-                val = self.handle_notification() => { assert!(val.unwrap().is_none()); }
-                val = submissions.recv() => { if let Some((job_id, nonce_hex, ts)) = val {
-                    self.submit(&job_id, &nonce_hex, ts).await.unwrap();
-                }}
+                val = self.handle_notification(None) => {
+                    match val {
+                        Ok(None) => {},
+                        _ => {
+                            println!("Disconnected, blocking computation until connection is recovered...");
+                            let clone = self.current_job.clone();
+                            let mut guard = clone.lock().unwrap();
+
+                            let mut backoff = ExponentialBackoff::default();
+
+                            while let Err(e) = self.reconnect(&mut guard).await {
+                                println!("Error while reconnecting, retrying: {}", e);
+                                tokio::time::sleep(backoff.next_backoff().unwrap()).await;
+                            }
+                            println!("Reconnected, resuming computation.");
+                        }
+                    }
+                }
+                val = submissions.recv() => {
+                    if let Some((job_id, nonce_hex, ts)) = val {
+                        if let Err(e) = self.submit(&job_id, &nonce_hex, ts).await {
+                            println!("Error submitting share: {}", e);
+                        }
+                    }
+                }
                 val = &mut stop => {
                     val.unwrap();
                     submissions.close();
                     while let Some((job_id, nonce_hex, ts)) = submissions.recv().await {
-                        self.submit(&job_id, &nonce_hex, ts).await.unwrap();
+                        if let Err(e) = self.submit(&job_id, &nonce_hex, ts).await {
+                            println!("Error submitting share: {}", e);
+                        }
                     }
                     return;
                 }
@@ -191,25 +235,25 @@ impl ClientInner {
         }
     }
 
-    async fn request(&mut self, mut req: Request) -> std::io::Result<Response> {
+    async fn request(&mut self, mut req: Request, lock: Option<&mut JobInfo>) -> anyhow::Result<Response> {
         self.req_id += 1;
         req.id = self.req_id.into();
         let req = serde_json::to_vec(&req).unwrap();
         self.tx.write_all(&req).await?;
         self.tx.write_u8(b'\n').await?;
         self.tx.flush().await?;
-        self.get_response().await
+        self.get_response(lock).await
     }
 
-    async fn connect(&mut self, user_agent: &str, username: &str, password: &str) -> std::io::Result<()> {
+    async fn connect(&mut self, mut lock: Option<&mut JobInfo>) -> anyhow::Result<()> {
         let subscribe = Request {
             method: "mining.subscribe".into(),
             params: vec![
-                user_agent.to_owned().into(), "EthereumStratum/1.0.0".into()
+                self.user_agent.to_owned().into(), "EthereumStratum/1.0.0".into(),
             ],
             id: 0.into(),
         };
-        let res = self.request(subscribe).await?;
+        let res = self.request(subscribe, lock.as_deref_mut()).await?;
         let res = res.result.unwrap();
         let res = res.as_array().unwrap()[0].as_array().unwrap();
         assert_eq!(res[0].as_str().unwrap(), "mining.notify");
@@ -217,26 +261,45 @@ impl ClientInner {
         let pool_nonce_bytes = start_nonce.len();
         start_nonce.resize(8, 0);
         let start_nonce = BigEndian::read_u64(&start_nonce);
-        let mut job = self.current_job.lock().unwrap();
+        let clone = self.current_job.clone();
+        let mut local_lock = None;
+        let mut job = lock.as_deref_mut().unwrap_or_else(|| {
+            local_lock = Some(clone.lock().unwrap());
+            local_lock.as_mut().unwrap()
+        });
         job.extra_nonce = start_nonce;
         job.pool_nonce_bytes = pool_nonce_bytes;
-        drop(job);
+        drop(local_lock);
 
         let authorize = Request {
             method: "mining.authorize".into(),
             params: vec![
-                username.into(), password.into()
+                self.username.as_str().into(), self.password.as_str().into(),
             ],
             id: 0.into(),
         };
 
-        let res = self.request(authorize).await?;
+        let res = self.request(authorize, lock.as_deref_mut()).await?;
         let res = res.result.unwrap();
         assert!(res.as_bool().unwrap());
         Ok(())
     }
 
-    async fn submit(&mut self, job_id: &str, nonce_hex: &str, received_ts: Instant) -> std::io::Result<()> {
+    async fn reconnect(&mut self, lock: &mut JobInfo) -> anyhow::Result<()> {
+        let conn = TcpStream::connect((&*self.hostname, self.port)).await?;
+        conn.set_nodelay(true)?;
+        let (rx, tx) = conn.into_split();
+        self.rx = BufReader::new(rx);
+        self.tx = BufWriter::new(tx);
+
+        self.connect(Some(lock)).await?;
+        while lock.seed_hash.is_empty() {
+            assert!(self.handle_notification(Some(lock)).await?.is_none());
+        }
+        Ok(())
+    }
+
+    async fn submit(&mut self, job_id: &str, nonce_hex: &str, received_ts: Instant) -> anyhow::Result<()> {
         let submit = Request {
             method: "mining.submit".into(),
             params: vec![
@@ -245,7 +308,7 @@ impl ClientInner {
             id: self.req_id.into(),
         };
         let before_send = Instant::now();
-        let res = self.request(submit).await?;
+        let res = self.request(submit, None).await?;
         let result = res.result.unwrap().as_bool().unwrap();
         if result {
             println!("Share accepted. ping: {:?}, total latency: {:?}", before_send.elapsed(), received_ts.elapsed());

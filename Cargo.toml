@@ -17,7 +17,9 @@ serde_derive = "1.0.126"
 hex = "0.4.3"
 rand = "0.8.3"
 clap = "3.0.0-beta.2"
-tokio = {version = "1.6.0", features = ["rt", "net", "io-util", "macros", "sync"]}
+tokio = {version = "1.6.0", features = ["rt", "net", "io-util", "macros", "sync", "time"]}
 url = "2.2.2"
 indicatif = "0.16.2"
 ctrlc = "3.1.9"
+anyhow = "1.0.45"
+backoff = "0.3.0"

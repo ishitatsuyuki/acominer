@@ -231,7 +231,7 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
     }
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> anyhow::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
         let stop = stop.clone();
@@ -307,7 +307,13 @@ Popular wisdoms say that this should be a multiple of your CU count.")
         )
         .get_matches();
     let url: Url = app.value_of_t("pool").unwrap();
-    let mut client = StratumClient::new(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")), &*url.socket_addrs(|| Some(4444)).unwrap(), url.username(), url.password().unwrap_or("X"))?;
+    let mut client = StratumClient::new(
+        concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
+        url.host_str().ok_or_else(|| anyhow::anyhow!("URL must include a hostname"))?,
+        url.port().unwrap_or(4444),
+        url.username(),
+        url.password().unwrap_or("X"),
+    )?;
 
     let physical: PhysicalDevice = PhysicalDevice::from_index(&instance, app.value_of("device").unwrap().parse().unwrap()).unwrap();
     assert_eq!(physical.properties().driver_id, Some(DriverId::MesaRADV));
