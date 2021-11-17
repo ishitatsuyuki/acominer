@@ -150,7 +150,9 @@ impl ClientInner {
         let mut buf = vec![];
         let _count = self.rx.read_until(b'\n', &mut buf).await?;
 
-        if let Ok(req) = serde_json::from_slice::<Request>(&buf[..buf.len() - 1]) {
+        if buf.is_empty() {
+            anyhow::bail!("Connection terminated unexpectedly");
+        } else if let Ok(req) = serde_json::from_slice::<Request>(&buf[..buf.len() - 1]) {
             let clone = self.current_job.clone();
             let mut local_lock = None;
             let mut job = lock.unwrap_or_else(|| {
