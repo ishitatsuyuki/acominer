@@ -10,25 +10,19 @@ uvec2 bswap64(uvec2 value) {
     return uvec2(bswap32(value.y), bswap32(value.x));
 }
 
-// Unsigned fast modulo, from Lemire, D., Kaser, O., & Kurz, N. (2019). Faster remainder by direct computation.
-// URL: https://arxiv.org/pdf/1902.01961.pdf
-uint fast_mod(uint n, uint64_t c, uint d) {
-    uint64_t low_bits = c * n;
-    uvec2 c_ = unpackUint2x32(c);
-    uint lo = uint(low_bits);
-    uint hi = uint(low_bits >> 32);
-    // Our goal: ((__uint128_t)lowbits * d) >> 64
+// Granlund-Montgomery-Warren fast division
+// Implementation based on https://github.com/ridiculousfish/libdivide/blob/afb8a8a722c57e10f0dabc028cc24d44fae2a2f1/libdivide.h#L915
+uint fast_mod(uint n, uvec3 data) {
+    uint d = data.x;
+    uint magic = data.y;
+    uint shift = data.z;
     uint discarded;
-    uint lod;
-    uint hid_lo;
-    uint hid_hi;
-    umulExtended(lo, d, lod, discarded);
-    umulExtended(hi, d, hid_hi, hid_lo);
-    uint carry;
-    uaddCarry(lod, hid_lo, carry);
-    return hid_hi + carry;
+    uint q;
+    umulExtended(n, magic, q, discarded);
+    uint t = (((n - q) >> 1) + q) >> shift;
+    return n - t * d;
 }
 
-uvec2 fast_mod(uvec2 n, uint64_t c, uint d) {
-    return uvec2(fast_mod(n.x, c, d), fast_mod(n.y, c, d));
+uvec2 fast_mod(uvec2 n, uvec3 d) {
+    return uvec2(fast_mod(n.x, d), fast_mod(n.y, d));
 }

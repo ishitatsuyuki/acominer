@@ -52,7 +52,7 @@ void main() {
     uvec2 sha[8];
     uint ix = uint(conf.start_nonce) + gl_GlobalInvocationID.x;
     uint th_ix = gl_LocalInvocationIndex;
-    uint cache_idx = fast_mod(ix, conf.light_size_c, conf.light_size);
+    uint cache_idx = fast_mod(ix, conf.light_size);
     for (int i = 0; i < 8; i++) {
         sha[i].x = light[cache_idx * 16 + i * 2];
         sha[i].y = light[cache_idx * 16 + i * 2 + 1];
@@ -64,7 +64,7 @@ void main() {
         mix[i * 2 + 1][th_ix] = sha[i].y;
     }
     for (int j = 0; j < 256; j++) {
-        uint cache_idx = fast_mod(fnv(ix ^ j, mix[j % 16][th_ix]), conf.light_size_c, conf.light_size);
+        uint cache_idx = fast_mod(fnv(ix ^ j, mix[j % 16][th_ix]), conf.light_size);
         for (int i = 0; i < 16; i++) {
             mix[i][th_ix] = fnv(mix[i][th_ix], light[cache_idx * 16 + i]);
         }

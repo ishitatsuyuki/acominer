@@ -114,11 +114,11 @@ void main() {
                     // All done on SGPR
 #ifdef WAVE64
                     uvec2 mix_i = uvec2(subgroupShuffle(mix[t][j], i % 32), subgroupShuffle(mix[t][j], i % 32 + 32));
-                    uvec2 p = fast_mod(fnv(i ^ s0[t][j], mix_i), conf.dag_size_mix_c, conf.dag_size_mix);
+                    uvec2 p = fast_mod(fnv(i ^ s0[t][j], mix_i), conf.dag_size_mix);
                     uvec2 p_idx = p * 32;
 #else
                     uint mix_i = subgroupShuffle(mix[t][j], i % 32);
-                    uint p = fast_mod(fnv(i ^ s0[t][j], mix_i), conf.dag_size_mix_c, conf.dag_size_mix);
+                    uint p = fast_mod(fnv(i ^ s0[t][j], mix_i), conf.dag_size_mix);
                     uint p_idx = p * 32;
 #endif
                     // Step 2: load value from DAG

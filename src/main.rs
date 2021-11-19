@@ -57,9 +57,16 @@ fn ceil_div(a: u64, b: u64) -> u64 {
     (a + b - 1) / b
 }
 
-// Calculate the constant for fast remainder. See shader/util.h.
-fn lkk_cvalue(d: u32) -> u64 {
-    0xFFFFFFFFFFFFFFFFu64 / d as u64 + 1
+// Calculate the constants for fast division. See shader/util.h.
+fn libdivide_u32_gen(d: u32) -> [u32; 3] {
+    let floor_log_2_d = 31 - d.leading_zeros();
+    let dividend = 1u64 << (floor_log_2_d + 32);
+    let mut proposed_m = dividend / d as u64;
+    let rem = dividend % d as u64;
+    proposed_m += proposed_m;
+    let twice_rem = (rem + rem) as u32;
+    if twice_rem >= d || twice_rem < rem as u32 { proposed_m += 1; }
+    [d, (proposed_m + 1) as u32, floor_log_2_d]
 }
 
 mod dag_cs {
@@ -133,11 +140,9 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
     let mut config = dag_cs::ty::Config {
         dag_read: Default::default(),
         dag_write: Default::default(),
-        light_size,
-        light_size_c: lkk_cvalue(light_size),
+        light_size: libdivide_u32_gen(light_size),
         dag_size,
-        dag_size_mix,
-        dag_size_mix_c: lkk_cvalue(dag_size_mix),
+        dag_size_mix: libdivide_u32_gen(dag_size_mix),
         g_header: Default::default(),
         start_nonce: 0,
         target: 0,
