@@ -5,21 +5,26 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[profile.release]
+codegen-units = 1
+opt-level = 3
+lto = "thin"
+
 [dependencies]
 sha3 = "0.9.1"
 miller_rabin = "1.0.6"
 byteorder = "1.4.3"
 vulkano = { git = "https://github.com/ishitatsuyuki/vulkano.git", branch = "acominer" }
 vulkano-shaders = { git = "https://github.com/ishitatsuyuki/vulkano.git", branch = "acominer" }
-serde = "1.0.126"
-serde_json = "1.0.64"
-serde_derive = "1.0.126"
+serde = "1.0.130"
+serde_json = "1.0.71"
+serde_derive = "1.0.130"
 hex = "0.4.3"
-rand = "0.8.3"
+rand = "0.8.4"
 clap = "3.0.0-beta.2"
-tokio = {version = "1.6.0", features = ["rt", "net", "io-util", "macros", "sync", "time"]}
+tokio = {version = "1.14.0", features = ["rt", "net", "io-util", "macros", "sync", "time"]}
 url = "2.2.2"
 indicatif = "0.16.2"
-ctrlc = "3.1.9"
-anyhow = "1.0.45"
+ctrlc = "3.2.1"
+anyhow = "1.0.47"
 backoff = "0.3.0"
