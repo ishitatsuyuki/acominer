@@ -21,9 +21,11 @@ jobs:
             ${{ runner.os }}-sccache-
       - run: |
           sudo sed -i -- 's/# deb-src/deb-src/g' /etc/apt/sources.list
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-focal.list https://packages.lunarg.com/vulkan/lunarg-vulkan-focal.list
           sudo apt update
           sudo apt build-dep libdrm mesa -y
-          sudo apt install cmake -y
+          sudo apt install cmake vulkan-sdk -y
       - name: Install sccache
         env:
           LINK: https://github.com/mozilla/sccache/releases/download
