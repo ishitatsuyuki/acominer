@@ -311,7 +311,8 @@ impl ClientInner {
         };
         let before_send = Instant::now();
         let res = self.request(submit, None).await?;
-        let result = res.result.unwrap().as_bool().unwrap();
+        let result = res.result.ok_or_else(|| anyhow::anyhow!("mining.submit response is empty"))?
+            .as_bool().ok_or_else(|| anyhow::anyhow!("mining.submit result should be a bool"))?;
         if result {
             println!("Share accepted. ping: {:?}, total latency: {:?}", before_send.elapsed(), received_ts.elapsed());
         } else {
