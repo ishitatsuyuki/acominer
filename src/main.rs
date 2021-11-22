@@ -146,7 +146,6 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
         g_header: Default::default(),
         start_nonce: 0,
         target: 0,
-        zero: 0,
         ..Default::default()
     };
 

@@ -15,8 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with Gateless Gate Sharp.  If not, see <http://www.gnu.org/licenses/>.
 
-#define DISABLE_UNROLL(loop_counter) loop_counter ^= conf.zero
-
 /* FNV */
 
 #define FNV_PRIME 0x01000193u
@@ -144,9 +142,9 @@ const uvec2 Keccak_f1600_RC[24] = {
 
 
 #define KECCAK_PROCESS(st, in_size, out_size)    do { \
+    [[dont_unroll]] \
     for (int r = 0; r < 24; ++r) { \
         int os = (r < 23 ? 25 : (out_size));\
         KECCAKF_1600_RND(st, r, os); \
-        DISABLE_UNROLL(r); \
     } \
 } while(false)

@@ -33,8 +33,6 @@ struct Config {
     uvec2 g_header[4];
     uint64_t start_nonce;
     uint64_t target;
-    // Opaque value to disable loop unrolling
-    int zero;
 };
 
 #define OUTPUT_ENTRY_COUNT 8
