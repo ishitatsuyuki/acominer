@@ -57,18 +57,6 @@ fn ceil_div(a: u64, b: u64) -> u64 {
     (a + b - 1) / b
 }
 
-// Calculate the constants for fast division. See shader/util.h.
-fn libdivide_u32_gen(d: u32) -> [u32; 3] {
-    let floor_log_2_d = 31 - d.leading_zeros();
-    let dividend = 1u64 << (floor_log_2_d + 32);
-    let mut proposed_m = dividend / d as u64;
-    let rem = dividend % d as u64;
-    proposed_m += proposed_m;
-    let twice_rem = (rem + rem) as u32;
-    if twice_rem >= d || twice_rem < rem as u32 { proposed_m += 1; }
-    [d, (proposed_m + 1) as u32, floor_log_2_d]
-}
-
 mod dag_cs {
     vulkano_shaders::shader! {
         ty: "compute",
@@ -134,15 +122,11 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
     let dag_wg_count = ceil_div(full_size as u64, dag_quantum);
     let dag_words = (dag_wg_count * dag_quantum / 4) as usize;
     let light_size = (cache_size / 64) as u32;
-    let dag_size = (full_size / 64) as u32;
     let dag_size_mix = (full_size / 128) as u32;
 
     let mut config = dag_cs::ty::Config {
         dag_read: Default::default(),
         dag_write: Default::default(),
-        light_size: libdivide_u32_gen(light_size),
-        dag_size,
-        dag_size_mix: libdivide_u32_gen(dag_size_mix),
         g_header: Default::default(),
         start_nonce: 0,
         target: 0,
@@ -159,7 +143,7 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
 
     let dag_pipeline = Arc::new({
         let shader = dag_cs::Shader::load(device.clone()).unwrap();
-        ComputePipeline::new(device.clone(), &shader.main_entry_point(), &(), None, Some(subgroup_size)).unwrap()
+        ComputePipeline::new(device.clone(), &shader.main_entry_point(), &dag_cs::SpecializationConstants { light_size }, None, Some(subgroup_size)).unwrap()
     });
 
     let dag_layout = dag_pipeline.layout().descriptor_set_layout(0).unwrap();
@@ -178,10 +162,10 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
         let search_pipeline = Arc::new({
             if subgroup_size == 64 {
                 let shader = search_cs_64::Shader::load(device.clone()).unwrap();
-                ComputePipeline::new(device.clone(), &shader.main_entry_point(), &(), None, Some(subgroup_size)).unwrap()
+                ComputePipeline::new(device.clone(), &shader.main_entry_point(), &search_cs_64::SpecializationConstants { dag_size_mix }, None, Some(subgroup_size)).unwrap()
             } else {
                 let shader = search_cs::Shader::load(device.clone()).unwrap();
-                ComputePipeline::new(device.clone(), &shader.main_entry_point(), &(), None, Some(subgroup_size)).unwrap()
+                ComputePipeline::new(device.clone(), &shader.main_entry_point(), &search_cs::SpecializationConstants { dag_size_mix }, None, Some(subgroup_size)).unwrap()
             }
         });
 

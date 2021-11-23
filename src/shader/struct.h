@@ -24,12 +24,6 @@ layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Wr
 struct Config {
     ReadDag dag_read;
     WriteDag dag_write;
-    // Constants for fast division is contained in the y and z components, see util.h.
-    uvec3 light_size;
-    uint dag_size;
-    // dag_size_mix is dag_size / 2, used as the divisor in the mix stage.
-    // Constants for fast division is contained in the y and z components, see util.h.
-    uvec3 dag_size_mix;
     uvec2 g_header[4];
     uint64_t start_nonce;
     uint64_t target;
