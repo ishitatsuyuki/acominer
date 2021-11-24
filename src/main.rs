@@ -16,15 +16,14 @@ use byteorder::{ByteOrder, LittleEndian};
 use clap::ValueHint;
 use indicatif::{HumanDuration, ProgressBar};
 use url::Url;
+use vulkano::{DeviceSize, sync};
 use vulkano::buffer::{BufferAccess, BufferUsage, CpuAccessibleBuffer, DeviceLocalBuffer, ImmutableBuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
-use vulkano::descriptor::descriptor_set::{PersistentDescriptorSet, UnsafeDescriptorSetLayout};
-use vulkano::descriptor::DescriptorSet;
+use vulkano::descriptor_set::{DescriptorSetWithOffsets, layout::DescriptorSetLayout, PersistentDescriptorSet};
 use vulkano::device::{Device, DeviceExtensions, Features, Queue};
-use vulkano::instance::{ApplicationInfo, DriverId, Instance, InstanceExtensions, PhysicalDevice, QueueFamily};
-use vulkano::pipeline::ComputePipeline;
-use vulkano::pipeline::ComputePipelineAbstract;
-use vulkano::sync;
+use vulkano::device::physical::{DriverId, PhysicalDevice, QueueFamily};
+use vulkano::instance::{ApplicationInfo, Instance, InstanceExtensions};
+use vulkano::pipeline::{ComputePipeline, Pipeline, PipelineBindPoint};
 use vulkano::sync::{Fence, FenceSignalFuture, FenceWaitError, GpuFuture};
 use vulkano::Version;
 
@@ -105,8 +104,8 @@ struct MinerPipeline {
 struct SearchPipeline {
     output_buf: Arc<CpuAccessibleBuffer<search_cs::ty::Output>>,
     pipeline: Arc<ComputePipeline>,
-    layout: Arc<UnsafeDescriptorSetLayout>,
-    set: Arc<dyn DescriptorSet + Send + Sync>,
+    layout: Arc<DescriptorSetLayout>,
+    set: DescriptorSetWithOffsets,
 }
 
 fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFamily, seed_hash: &[u8], count: usize, subgroup_size: u32) -> MinerPipeline {
@@ -133,7 +132,7 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
         ..Default::default()
     };
 
-    let dag0_buf = DeviceLocalBuffer::<[u32]>::array(device.clone(), dag_words, BUFFER_USAGE, Some(queue_family)).unwrap();
+    let dag0_buf = DeviceLocalBuffer::<[u32]>::array(device.clone(), dag_words as DeviceSize, BUFFER_USAGE, Some(queue_family)).unwrap();
     config.dag_read = dag0_buf.raw_device_address().unwrap().into();
     config.dag_write = dag0_buf.raw_device_address().unwrap().into();
 
@@ -141,17 +140,15 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
     light_upload.then_signal_fence_and_flush().unwrap().wait(None).unwrap();
     println!("Light cache transferred to GPU.");
 
-    let dag_pipeline = Arc::new({
-        let shader = dag_cs::Shader::load(device.clone()).unwrap();
-        ComputePipeline::new(device.clone(), &shader.main_entry_point(), &dag_cs::SpecializationConstants { light_size }, None, Some(subgroup_size)).unwrap()
-    });
+    let dag_pipeline = {
+        let shader = dag_cs::load(device.clone()).unwrap();
+        ComputePipeline::new(device.clone(), shader.entry_point("main").unwrap(), &dag_cs::SpecializationConstants { light_size }, None, Some(subgroup_size), |_| {}).unwrap()
+    };
 
-    let dag_layout = dag_pipeline.layout().descriptor_set_layout(0).unwrap();
-    let dag_set = Arc::new(
-        PersistentDescriptorSet::start(dag_layout.clone())
-            .add_buffer(light_buf.clone()).unwrap()
-            .build().unwrap(),
-    );
+    let dag_layout = &dag_pipeline.layout().descriptor_set_layouts()[0];
+    let mut dag_set_builder = PersistentDescriptorSet::start(dag_layout.clone());
+    dag_set_builder.add_buffer(light_buf.clone()).unwrap();
+    let dag_set = dag_set_builder.build().unwrap();
 
     let mut search_pipelines = vec![];
     for _ in 0..count {
@@ -159,28 +156,24 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
             CpuAccessibleBuffer::from_data(device.clone(), BUFFER_USAGE_WITH_TRANSFER, false, search_cs::ty::Output::default()).unwrap()
         };
 
-        let search_pipeline = Arc::new({
-            if subgroup_size == 64 {
-                let shader = search_cs_64::Shader::load(device.clone()).unwrap();
-                ComputePipeline::new(device.clone(), &shader.main_entry_point(), &search_cs_64::SpecializationConstants { dag_size_mix }, None, Some(subgroup_size)).unwrap()
-            } else {
-                let shader = search_cs::Shader::load(device.clone()).unwrap();
-                ComputePipeline::new(device.clone(), &shader.main_entry_point(), &search_cs::SpecializationConstants { dag_size_mix }, None, Some(subgroup_size)).unwrap()
-            }
-        });
+        let search_pipeline = if subgroup_size == 64 {
+            let shader = search_cs_64::load(device.clone()).unwrap();
+            ComputePipeline::new(device.clone(), shader.entry_point("main").unwrap(), &search_cs_64::SpecializationConstants { dag_size_mix }, None, Some(subgroup_size), |_| {}).unwrap()
+        } else {
+            let shader = search_cs::load(device.clone()).unwrap();
+            ComputePipeline::new(device.clone(), shader.entry_point("main").unwrap(), &search_cs::SpecializationConstants { dag_size_mix }, None, Some(subgroup_size), |_| {}).unwrap()
+        };
 
-        let search_layout = search_pipeline.layout().descriptor_set_layout(0).unwrap();
-        let search_set = Arc::new(
-            PersistentDescriptorSet::start(search_layout.clone())
-                .add_buffer(output_buf.clone()).unwrap()
-                .build().unwrap(),
-        );
+        let search_layout = &search_pipeline.layout().descriptor_set_layouts()[0];
+        let mut search_set_builder = PersistentDescriptorSet::start(search_layout.clone());
+        search_set_builder.add_buffer(output_buf.clone()).unwrap();
+        let search_set = search_set_builder.build().unwrap();
 
         search_pipelines.push(SearchPipeline {
             output_buf,
             pipeline: search_pipeline.clone(),
             layout: search_layout.clone(),
-            set: search_set.clone(),
+            set: search_set.clone().into(),
         });
     }
 
@@ -188,7 +181,7 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
     println!("Building DAG...");
     let mut completed = 0;
     while completed != dag_wg_count {
-        let to_schedule = std::cmp::min(std::cmp::min(14400, device.physical_device().properties().max_compute_work_group_count.unwrap()[0] as u64), dag_wg_count - completed);
+        let to_schedule = std::cmp::min(std::cmp::min(14400, device.physical_device().properties().max_compute_work_group_count[0] as u64), dag_wg_count - completed);
         config.start_nonce = (completed * 64) as _;
 
         let mut builder = AutoCommandBufferBuilder::primary(
@@ -196,7 +189,16 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
             queue.family(),
             CommandBufferUsage::OneTimeSubmit,
         ).unwrap();
-        builder.dispatch([to_schedule as u32, 1, 1], dag_pipeline.clone(), dag_set.clone(), dag_cs::ty::PushConstants { conf: config }, vec![]).unwrap();
+        builder
+            .bind_pipeline_compute(dag_pipeline.clone())
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                dag_pipeline.layout().clone(),
+                0,
+                dag_set.clone(),
+            )
+            .push_constants(dag_pipeline.layout().clone(), 0, dag_cs::ty::PushConstants { conf: config });
+        builder.dispatch([to_schedule as u32, 1, 1]).unwrap();
         let command_buffer = builder.build().unwrap();
 
         let future = sync::now(device.clone())
@@ -318,8 +320,8 @@ Popular wisdoms say that this should be a multiple of your CU count.")
 
     println!(
         "Using device: {} (type: {:?})",
-        physical.properties().device_name.as_ref().unwrap(),
-        physical.properties().device_type.unwrap()
+        physical.properties().device_name,
+        physical.properties().device_type
     );
 
     let pipeline_count: usize = app.value_of_t("buffers").unwrap();
@@ -430,7 +432,16 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                 queue_family,
                 CommandBufferUsage::OneTimeSubmit,
             ).unwrap();
-            builder.dispatch([wg_count as _, 1, 1], pipeline.search[current_pipeline].pipeline.clone(), pipeline.search[current_pipeline].set.clone(), dag_cs::ty::PushConstants { conf: pipeline.config }, vec![]).unwrap();
+            builder
+                .bind_pipeline_compute(pipeline.search[current_pipeline].pipeline.clone())
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    pipeline.search[current_pipeline].pipeline.layout().clone(),
+                    0,
+                    pipeline.search[current_pipeline].set.clone(),
+                )
+                .push_constants(pipeline.search[current_pipeline].pipeline.layout().clone(), 0, dag_cs::ty::PushConstants { conf: pipeline.config });
+            builder.dispatch([wg_count as _, 1, 1]).unwrap();
             let command_buffer = builder.build().unwrap();
 
             let future = sync::now(device.clone())
