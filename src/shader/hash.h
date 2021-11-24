@@ -142,8 +142,9 @@ const uvec2 Keccak_f1600_RC[24] = {
 
 
 #define KECCAK_PROCESS(st, in_size, out_size)    do { \
+    KECCAKF_1600_RND(st, 0, 25); \
     [[dont_unroll]] \
-    for (int r = 0; r < 24; ++r) { \
+    for (int r = 1; r < 24; ++r) { \
         int os = (r < 23 ? 25 : (out_size));\
         KECCAKF_1600_RND(st, r, os); \
     } \
