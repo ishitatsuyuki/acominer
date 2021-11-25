@@ -11,9 +11,9 @@ struct OutputEntry {
     uint[8] mix;
 };
 
-layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ReadDag
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ReadDag
 {
-    uint values[];
+    uint[4] values[];
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer WriteDag

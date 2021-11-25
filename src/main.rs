@@ -36,6 +36,7 @@ mod stratum;
 const DEVICE_EXTENSIONS: DeviceExtensions = DeviceExtensions {
     khr_storage_buffer_storage_class: true,
     ext_subgroup_size_control: true,
+    amd_shader_ballot: true,
     ..DeviceExtensions::none()
 };
 
