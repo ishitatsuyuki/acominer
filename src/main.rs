@@ -11,6 +11,7 @@ use std::num::ParseIntError;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use anyhow::Context;
 
 use byteorder::{ByteOrder, LittleEndian};
 use clap::ValueHint;
@@ -109,7 +110,7 @@ struct SearchPipeline {
     set: DescriptorSetWithOffsets,
 }
 
-fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFamily, seed_hash: &[u8], count: usize, subgroup_size: u32) -> MinerPipeline {
+fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFamily, seed_hash: &[u8], count: usize, subgroup_size: u32) -> anyhow::Result<MinerPipeline> {
     println!("Generating light cache (CPU)...");
     let epoch = epoch_from_seed_hash(seed_hash.try_into().unwrap(), 65536).unwrap(); // FIXME: hardcoded limit
     let cache_size = get_cache_size(epoch);
@@ -133,42 +134,43 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
         ..Default::default()
     };
 
-    let dag0_buf = DeviceLocalBuffer::<[u32]>::array(device.clone(), dag_words as DeviceSize, BUFFER_USAGE, Some(queue_family)).unwrap();
-    config.dag_read = dag0_buf.raw_device_address().unwrap().into();
-    config.dag_write = dag0_buf.raw_device_address().unwrap().into();
+    let dag0_buf = DeviceLocalBuffer::<[u32]>::array(device.clone(), dag_words as DeviceSize, BUFFER_USAGE, Some(queue_family))
+        .context("Failed to allocate DAG. This can mean that the amount of VRAM on your GPU is not sufficient, or you are running an unsupported driver.")?;
+    config.dag_read = dag0_buf.raw_device_address()?.into();
+    config.dag_write = dag0_buf.raw_device_address()?.into();
 
-    let (light_buf, light_upload) = ImmutableBuffer::from_iter(light.iter().cloned(), BUFFER_USAGE, queue.clone()).unwrap();
-    light_upload.then_signal_fence_and_flush().unwrap().wait(None).unwrap();
+    let (light_buf, light_upload) = ImmutableBuffer::from_iter(light.iter().cloned(), BUFFER_USAGE, queue.clone())?;
+    light_upload.then_signal_fence_and_flush()?.wait(None)?;
     println!("Light cache transferred to GPU.");
 
     let dag_pipeline = {
-        let shader = dag_cs::load(device.clone()).unwrap();
-        ComputePipeline::new(device.clone(), shader.entry_point("main").unwrap(), &dag_cs::SpecializationConstants { light_size }, None, Some(subgroup_size), |_| {}).unwrap()
+        let shader = dag_cs::load(device.clone())?;
+        ComputePipeline::new(device.clone(), shader.entry_point("main").unwrap(), &dag_cs::SpecializationConstants { light_size }, None, Some(subgroup_size), |_| {})?
     };
 
     let dag_layout = &dag_pipeline.layout().descriptor_set_layouts()[0];
     let mut dag_set_builder = PersistentDescriptorSet::start(dag_layout.clone());
-    dag_set_builder.add_buffer(light_buf.clone()).unwrap();
-    let dag_set = dag_set_builder.build().unwrap();
+    dag_set_builder.add_buffer(light_buf.clone())?;
+    let dag_set = dag_set_builder.build()?;
 
     let mut search_pipelines = vec![];
     for _ in 0..count {
         let output_buf = {
-            CpuAccessibleBuffer::from_data(device.clone(), BUFFER_USAGE_WITH_TRANSFER, false, search_cs::ty::Output::default()).unwrap()
+            CpuAccessibleBuffer::from_data(device.clone(), BUFFER_USAGE_WITH_TRANSFER, false, search_cs::ty::Output::default())?
         };
 
         let search_pipeline = if subgroup_size == 64 {
-            let shader = search_cs_64::load(device.clone()).unwrap();
-            ComputePipeline::new(device.clone(), shader.entry_point("main").unwrap(), &search_cs_64::SpecializationConstants { dag_size_mix }, None, Some(subgroup_size), |_| {}).unwrap()
+            let shader = search_cs_64::load(device.clone())?;
+            ComputePipeline::new(device.clone(), shader.entry_point("main").unwrap(), &search_cs_64::SpecializationConstants { dag_size_mix }, None, Some(subgroup_size), |_| {})?
         } else {
-            let shader = search_cs::load(device.clone()).unwrap();
-            ComputePipeline::new(device.clone(), shader.entry_point("main").unwrap(), &search_cs::SpecializationConstants { dag_size_mix }, None, Some(subgroup_size), |_| {}).unwrap()
+            let shader = search_cs::load(device.clone())?;
+            ComputePipeline::new(device.clone(), shader.entry_point("main").unwrap(), &search_cs::SpecializationConstants { dag_size_mix }, None, Some(subgroup_size), |_| {})?
         };
 
         let search_layout = &search_pipeline.layout().descriptor_set_layouts()[0];
         let mut search_set_builder = PersistentDescriptorSet::start(search_layout.clone());
-        search_set_builder.add_buffer(output_buf.clone()).unwrap();
-        let search_set = search_set_builder.build().unwrap();
+        search_set_builder.add_buffer(output_buf.clone())?;
+        let search_set = search_set_builder.build()?;
 
         search_pipelines.push(SearchPipeline {
             output_buf,
@@ -189,7 +191,7 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
             device.clone(),
             queue.family(),
             CommandBufferUsage::OneTimeSubmit,
-        ).unwrap();
+        )?;
         builder
             .bind_pipeline_compute(dag_pipeline.clone())
             .bind_descriptor_sets(
@@ -199,27 +201,25 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
                 dag_set.clone(),
             )
             .push_constants(dag_pipeline.layout().clone(), 0, dag_cs::ty::PushConstants { conf: config });
-        builder.dispatch([to_schedule as u32, 1, 1]).unwrap();
-        let command_buffer = builder.build().unwrap();
+        builder.dispatch([to_schedule as u32, 1, 1])?;
+        let command_buffer = builder.build()?;
 
         let future = sync::now(device.clone())
-            .then_execute(queue.clone(), command_buffer)
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap();
+            .then_execute(queue.clone(), command_buffer)?
+            .then_signal_fence_and_flush()?;
 
-        future.wait(None).unwrap();
+        future.wait(None)?;
         completed += to_schedule;
         progress.set_position(completed);
     }
     progress.finish();
     println!("DAG built in {}", HumanDuration(progress.elapsed()));
 
-    MinerPipeline {
+    Ok(MinerPipeline {
         config,
         dag0_buf,
         search: search_pipelines,
-    }
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -245,7 +245,7 @@ fn main() -> anyhow::Result<()> {
         engine_name: None,
         engine_version: None,
     };
-    let instance = Instance::new(Some(&app_info), Version::V1_2, &InstanceExtensions::none(), None).unwrap();
+    let instance = Instance::new(Some(&app_info), Version::V1_2, &InstanceExtensions::none(), None)?;
     let app = clap::App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .arg(
@@ -306,10 +306,11 @@ Popular wisdoms say that this should be a multiple of your CU count.")
         url.password().unwrap_or("X"),
     )?;
 
-    let physical: PhysicalDevice = PhysicalDevice::from_index(&instance, app.value_of("device").unwrap().parse().unwrap()).unwrap();
+    let device_idx = app.value_of("device").unwrap().parse().unwrap();
+    let physical: PhysicalDevice = PhysicalDevice::from_index(&instance, device_idx).ok_or_else(|| anyhow::anyhow!("Device {} not found", device_idx))?;
     assert_eq!(physical.properties().driver_id, Some(DriverId::MesaRADV));
     if physical.properties().driver_id == Some(DriverId::AMDOpenSource) {
-        panic!("AMDVLK will corrupt GPU state when allocating 4GB+ of memory. DO NOT USE!");
+        anyhow::bail!("Driver blacklisted: AMDVLK is not supported because it causes system instability with more than 4GB of allocations");
     }
 
     let queue_family = physical
@@ -337,8 +338,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
         },
         &DEVICE_EXTENSIONS,
         std::iter::once((queue_family, 0.5)),
-    )
-        .unwrap();
+    )?;
 
     let queue = queues.next().unwrap();
 
@@ -358,7 +358,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
     }
     while !stop.load(Ordering::SeqCst) {
         let job = client.current_job();
-        let mut pipeline = build_pipeline(device.clone(), queue.clone(), queue_family, &job.seed_hash, pipeline_count, subgroup_size);
+        let mut pipeline = build_pipeline(device.clone(), queue.clone(), queue_family, &job.seed_hash, pipeline_count, subgroup_size)?;
         let current_seed_hash = job.seed_hash;
         let mut hash_counter = 0u64;
         let mut start_time = Instant::now();
@@ -374,14 +374,14 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                 target
             });
             if let Some((future, ..)) = futures[current_pipeline].as_ref() {
-                future.wait(None).unwrap();
+                future.wait(None)?;
             }
             loop {
                 for i in 0..pipeline_count {
                     if let Some((future, start_nonce, job)) = futures[i].as_mut() {
                         if future.get_fence().map(|x| x.ready().unwrap()).unwrap_or(true) {
-                            future.wait(None).unwrap();
-                            let output_buf = pipeline.search[i].output_buf.read().unwrap();
+                            future.wait(None)?;
+                            let output_buf = pipeline.search[i].output_buf.read()?;
                             for i in 0..output_buf.output_count {
                                 client.submit(&job, *start_nonce + output_buf.outputs[i as usize].gid as u64);
                             }
@@ -420,7 +420,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
             }
 
             pipeline.config.start_nonce = job.extra_nonce | (nonce & nonce_mask);
-            pipeline.search[current_pipeline].output_buf.write().unwrap().output_count = 0;
+            pipeline.search[current_pipeline].output_buf.write()?.output_count = 0;
             for i in 0..4 {
                 let mut target = [0; 2];
                 LittleEndian::read_u32_into(&job.header_hash[i * 8..i * 8 + 8], &mut target);
@@ -432,7 +432,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                 device.clone(),
                 queue_family,
                 CommandBufferUsage::OneTimeSubmit,
-            ).unwrap();
+            )?;
             builder
                 .bind_pipeline_compute(pipeline.search[current_pipeline].pipeline.clone())
                 .bind_descriptor_sets(
@@ -442,14 +442,12 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                     pipeline.search[current_pipeline].set.clone(),
                 )
                 .push_constants(pipeline.search[current_pipeline].pipeline.layout().clone(), 0, dag_cs::ty::PushConstants { conf: pipeline.config });
-            builder.dispatch([wg_count as _, 1, 1]).unwrap();
-            let command_buffer = builder.build().unwrap();
+            builder.dispatch([wg_count as _, 1, 1])?;
+            let command_buffer = builder.build()?;
 
             let future = sync::now(device.clone())
-                .then_execute(queue.clone(), command_buffer)
-                .unwrap()
-                .then_signal_fence_and_flush()
-                .unwrap();
+                .then_execute(queue.clone(), command_buffer)?
+                .then_signal_fence_and_flush()?;
             assert!(futures[current_pipeline].is_none());
             futures[current_pipeline] = Some((future, pipeline.config.start_nonce, job.clone()));
 
