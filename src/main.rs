@@ -226,7 +226,12 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
+    // FIXME: https://github.com/tokio-rs/tracing/issues/735 https://github.com/tokio-rs/tracing/issues/1697
+    let log_env = std::env::var(EnvFilter::DEFAULT_ENV).map(|mut s| {
+        s.insert_str(0, "info,");
+        s
+    }).unwrap_or_else(|_| String::from("info"));
+    tracing_subscriber::fmt().with_env_filter(EnvFilter::new(log_env)).init();
     let stop = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
         let stop = stop.clone();
