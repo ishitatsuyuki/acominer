@@ -12,6 +12,7 @@ use tokio::io::{BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, info};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 /// A JSON-RPC request object
@@ -165,11 +166,13 @@ impl ClientInner {
                     // Flawed, but works
                     let d = req.params[0].as_f64().unwrap();
                     job.difficulty = (d.recip() * 0x00000000ffff0000u64 as f64) as u64;
+                    info!(difficulty = %format!("{:.2}G", 64f64.exp2() / job.difficulty as f64 / 1000f64.powf(3.0)), "Pool set difficulty");
                 }
                 "mining.notify" => {
                     let job_id = req.params[0].as_str().unwrap().to_owned();
                     let seed_hash = hex::decode(req.params[1].as_str().unwrap())?;
                     let header_hash = hex::decode(req.params[2].as_str().unwrap())?;
+                    debug!(%job_id, "Job received");
                     // clean_jobs is unimplemented
                     job.job_id = job_id;
                     job.seed_hash = seed_hash;
@@ -202,24 +205,24 @@ impl ClientInner {
                     match val {
                         Ok(None) => {},
                         _ => {
-                            println!("Disconnected, blocking computation until connection is recovered...");
+                            error!("Disconnected, blocking computation until connection is recovered...");
                             let clone = self.current_job.clone();
                             let mut guard = clone.lock().unwrap();
 
                             let mut backoff = ExponentialBackoff::default();
 
                             while let Err(e) = self.reconnect(&mut guard).await {
-                                println!("Error while reconnecting, retrying: {}", e);
+                                error!("Error while reconnecting, retrying: {}", e);
                                 tokio::time::sleep(backoff.next_backoff().unwrap()).await;
                             }
-                            println!("Reconnected, resuming computation.");
+                            info!("Reconnected, resuming computation.");
                         }
                     }
                 }
                 val = submissions.recv() => {
                     if let Some((job_id, nonce_hex, ts)) = val {
                         if let Err(e) = self.submit(&job_id, &nonce_hex, ts).await {
-                            println!("Error submitting share: {}", e);
+                            error!("Error submitting share: {}", e);
                         }
                     }
                 }
@@ -228,7 +231,7 @@ impl ClientInner {
                     submissions.close();
                     while let Some((job_id, nonce_hex, ts)) = submissions.recv().await {
                         if let Err(e) = self.submit(&job_id, &nonce_hex, ts).await {
-                            println!("Error submitting share: {}", e);
+                            error!("Error submitting share: {}", e);
                         }
                     }
                     return;
@@ -317,9 +320,9 @@ impl ClientInner {
             _ => anyhow::bail!("mining.submit result should be a bool"),
         };
         if result {
-            println!("Share accepted. ping: {:?}, total latency: {:?}", before_send.elapsed(), received_ts.elapsed());
+            info!(ping = ?before_send.elapsed(), time_since_job=?received_ts.elapsed(), "Share accepted");
         } else {
-            println!("Share rejected: {:?}", res.error);
+            error!("Share rejected: {:?}", res.error);
         }
         Ok(())
     }

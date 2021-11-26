@@ -23,3 +23,5 @@ indicatif = "0.16.2"
 ctrlc = "3.1.9"
 anyhow = "1.0.45"
 backoff = "0.3.0"
+tracing = "0.1.29"
+tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
