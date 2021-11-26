@@ -6,7 +6,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::convert::TryInto;
 use std::num::ParseIntError;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +30,7 @@ use vulkano::pipeline::{ComputePipeline, Pipeline, PipelineBindPoint};
 use vulkano::sync::{Fence, FenceSignalFuture, FenceWaitError, GpuFuture};
 use vulkano::Version;
 
-use crate::cache::{epoch_from_seed_hash, get_cache_size, get_full_size, get_seed_hash, make_cache};
+use crate::cache::{get_cache_size, get_full_size, get_seed_hash, make_cache};
 use crate::stratum::{JobInfo, StratumClient};
 
 mod cache;
@@ -103,6 +102,7 @@ struct MinerPipeline {
     config: dag_cs::ty::Config,
     dag0_buf: Arc<DeviceLocalBuffer<[u32]>>,
     search: Vec<SearchPipeline>,
+    epoch: usize,
 }
 
 #[allow(dead_code)]
@@ -113,9 +113,8 @@ struct SearchPipeline {
     set: DescriptorSetWithOffsets,
 }
 
-fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFamily, seed_hash: &[u8], count: usize, subgroup_size: u32) -> anyhow::Result<MinerPipeline> {
+fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFamily, epoch: usize, count: usize, subgroup_size: u32) -> anyhow::Result<MinerPipeline> {
     info!("Generating light cache (CPU)...");
-    let epoch = epoch_from_seed_hash(seed_hash.try_into().unwrap(), 65536).unwrap(); // FIXME: hardcoded limit
     let cache_size = get_cache_size(epoch);
     let full_size = get_full_size(epoch);
     let mut light = vec![0; cache_size];
@@ -184,7 +183,7 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
     }
 
     let progress = ProgressBar::new(dag_wg_count);
-    info!("Building DAG...");
+    info!(epoch, "Building DAG...");
     let mut completed = 0;
     while completed != dag_wg_count {
         let to_schedule = std::cmp::min(std::cmp::min(14400, device.physical_device().properties().max_compute_work_group_count[0] as u64), dag_wg_count - completed);
@@ -222,6 +221,7 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
         config,
         dag0_buf,
         search: search_pipelines,
+        epoch,
     })
 }
 
@@ -366,8 +366,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
     }
     while !stop.load(Ordering::SeqCst) {
         let job = client.current_job();
-        let mut pipeline = build_pipeline(device.clone(), queue.clone(), queue_family, &job.seed_hash, pipeline_count, subgroup_size)?;
-        let current_seed_hash = job.seed_hash;
+        let mut pipeline = build_pipeline(device.clone(), queue.clone(), queue_family, job.epoch, pipeline_count, subgroup_size)?;
         let mut hash_counter = 0u64;
         let mut start_time = Instant::now();
         let mut current_pipeline = 0;
@@ -412,7 +411,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                 }
             }
             let job = client.current_job();
-            if stop.load(Ordering::SeqCst) || job.seed_hash != current_seed_hash
+            if stop.load(Ordering::SeqCst) || job.epoch != pipeline.epoch
             {
                 cleanup_counter += 1;
                 if cleanup_counter != pipeline_count {

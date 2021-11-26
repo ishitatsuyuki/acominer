@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::convert::TryInto;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -5,7 +7,7 @@ use std::time::Instant;
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 use byteorder::{BigEndian, ByteOrder};
-use serde_derive::{Deserialize, Serialize};
+use once_cell::sync::Lazy;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::io::{BufReader, BufWriter};
@@ -14,29 +16,41 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-/// A JSON-RPC request object
-pub struct Request {
-    /// A String containing the name of the method to be invoked
-    pub method: String,
-    /// An Array of objects to pass as arguments to the method
-    pub params: Vec<Value>,
-    /// The request id. This can be of any type. It is used to match the
-    /// response with the request that it is replying to
-    pub id: Value,
-}
+use crate::cache::epoch_lut;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-/// A JSON-RPC response object
-pub struct Response {
-    /// The Object that was returned by the invoked method. This must be null
-    /// in case there was a error invoking the method
-    pub result: Option<Value>,
-    /// An Error object if there was an error invoking the method. It must be
-    /// null if there was no error
-    pub error: Option<Value>,
-    /// This must be the same id as the request it is responding to
-    pub id: Value,
+static EPOCH_LUT: Lazy<HashMap<[u8; 32], usize>> = Lazy::new(|| {
+    // at epoch 4096 the dag size should have already exploded out of control, so it should be fine
+    epoch_lut(4096)
+});
+
+mod jsonrpc {
+    use serde_derive::{Deserialize, Serialize};
+    use serde_json::Value;
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    /// A JSON-RPC request object
+    pub struct Request {
+        /// A String containing the name of the method to be invoked
+        pub method: String,
+        /// An Array of objects to pass as arguments to the method
+        pub params: Vec<Value>,
+        /// The request id. This can be of any type. It is used to match the
+        /// response with the request that it is replying to
+        pub id: Value,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    /// A JSON-RPC response object
+    pub struct Response {
+        /// The Object that was returned by the invoked method. This must be null
+        /// in case there was a error invoking the method
+        pub result: Option<Value>,
+        /// An Error object if there was an error invoking the method. It must be
+        /// null if there was no error
+        pub error: Option<Value>,
+        /// This must be the same id as the request it is responding to
+        pub id: Value,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -46,8 +60,23 @@ pub struct JobInfo {
     pub extra_nonce: u64,
     pub pool_nonce_bytes: usize,
     pub job_id: String,
-    pub seed_hash: Vec<u8>,
+    pub epoch: usize,
     pub header_hash: Vec<u8>,
+}
+
+impl JobInfo {
+    fn set_difficulty(&mut self, scale: f64) {
+        self.difficulty = (scale.recip() * 0x00000000ffff0000u64 as f64) as u64;
+        info!(difficulty = %format!("{:.2}G", 64f64.exp2() / self.difficulty as f64 / 1000f64.powf(3.0)), "Pool set difficulty");
+    }
+
+    fn set_job(&mut self, job_id: String, epoch: usize, header_hash: Vec<u8>) {
+        debug!(%job_id, "Job received");
+        self.job_id = job_id;
+        self.epoch = epoch;
+        self.header_hash = header_hash;
+        self.received = Instant::now();
+    }
 }
 
 pub struct StratumClient {
@@ -79,7 +108,7 @@ impl StratumClient {
             extra_nonce: 0,
             pool_nonce_bytes: 0,
             job_id: "".to_string(),
-            seed_hash: vec![],
+            epoch: 0,
             header_hash: vec![],
         }));
         let mut inner = rt.block_on(Self::new_impl(hostname, port, current_job.clone(), user_agent, username, password))?;
@@ -118,7 +147,7 @@ impl StratumClient {
             port,
         };
         inner.connect(None).await?;
-        while inner.current_job.lock().unwrap().seed_hash.is_empty() {
+        while inner.current_job.lock().unwrap().epoch == 0 {
             assert!(inner.handle_notification(None).await?.is_none());
         }
         Ok(inner)
@@ -147,16 +176,16 @@ impl Drop for StratumClient {
 impl ClientInner {
     // Handle server side messages; return None if the message was processed, return the response
     // if the message was a response to a client request.
-    async fn handle_notification(&mut self, lock: Option<&mut JobInfo>) -> anyhow::Result<Option<Response>> {
+    async fn handle_notification(&mut self, lock: Option<&mut JobInfo>) -> anyhow::Result<Option<jsonrpc::Response>> {
         let mut buf = vec![];
         let _count = self.rx.read_until(b'\n', &mut buf).await?;
 
         if buf.is_empty() {
             anyhow::bail!("Connection terminated unexpectedly");
-        } else if let Ok(req) = serde_json::from_slice::<Request>(&buf[..buf.len() - 1]) {
+        } else if let Ok(req) = serde_json::from_slice::<jsonrpc::Request>(&buf[..buf.len() - 1]) {
             let clone = self.current_job.clone();
             let mut local_lock = None;
-            let mut job = lock.unwrap_or_else(|| {
+            let job = lock.unwrap_or_else(|| {
                 local_lock = Some(clone.lock().unwrap());
                 local_lock.as_mut().unwrap()
             });
@@ -165,31 +194,27 @@ impl ClientInner {
                 "mining.set_difficulty" => {
                     // Flawed, but works
                     let d = req.params[0].as_f64().unwrap();
-                    job.difficulty = (d.recip() * 0x00000000ffff0000u64 as f64) as u64;
-                    info!(difficulty = %format!("{:.2}G", 64f64.exp2() / job.difficulty as f64 / 1000f64.powf(3.0)), "Pool set difficulty");
+                    job.set_difficulty(d);
                 }
                 "mining.notify" => {
                     let job_id = req.params[0].as_str().unwrap().to_owned();
-                    let seed_hash = hex::decode(req.params[1].as_str().unwrap())?;
+                    let seed_hash: [u8; 32] = hex::decode(req.params[1].as_str().unwrap())?.try_into().unwrap();
+                    let epoch = *EPOCH_LUT.get(&seed_hash).ok_or_else(|| anyhow::anyhow!("Cannot resolve seed hash"))?;
                     let header_hash = hex::decode(req.params[2].as_str().unwrap())?;
-                    debug!(%job_id, "Job received");
                     // clean_jobs is unimplemented
-                    job.job_id = job_id;
-                    job.seed_hash = seed_hash;
-                    job.header_hash = header_hash;
-                    job.received = Instant::now();
+                    job.set_job(job_id, epoch, header_hash);
                 }
-                _ => unimplemented!(),
+                _ => anyhow::bail!("Unsupported stratum request {}", req.method),
             }
             Ok(None)
         } else {
-            let resp: Response = serde_json::from_slice(&buf[..buf.len() - 1])?;
+            let resp: jsonrpc::Response = serde_json::from_slice(&buf[..buf.len() - 1])?;
             Ok(Some(resp))
         }
     }
 
     /// Block until a response is received.
-    async fn get_response(&mut self, mut lock: Option<&mut JobInfo>) -> anyhow::Result<Response> {
+    async fn get_response(&mut self, mut lock: Option<&mut JobInfo>) -> anyhow::Result<jsonrpc::Response> {
         loop {
             let res = self.handle_notification(lock.as_deref_mut()).await?;
             if let Some(res) = res {
@@ -240,7 +265,7 @@ impl ClientInner {
         }
     }
 
-    async fn request(&mut self, mut req: Request, lock: Option<&mut JobInfo>) -> anyhow::Result<Response> {
+    async fn request(&mut self, mut req: jsonrpc::Request, lock: Option<&mut JobInfo>) -> anyhow::Result<jsonrpc::Response> {
         self.req_id += 1;
         req.id = self.req_id.into();
         let req = serde_json::to_vec(&req).unwrap();
@@ -251,7 +276,7 @@ impl ClientInner {
     }
 
     async fn connect(&mut self, mut lock: Option<&mut JobInfo>) -> anyhow::Result<()> {
-        let subscribe = Request {
+        let subscribe = jsonrpc::Request {
             method: "mining.subscribe".into(),
             params: vec![
                 self.user_agent.to_owned().into(), "EthereumStratum/1.0.0".into(),
@@ -276,7 +301,7 @@ impl ClientInner {
         job.pool_nonce_bytes = pool_nonce_bytes;
         drop(local_lock);
 
-        let authorize = Request {
+        let authorize = jsonrpc::Request {
             method: "mining.authorize".into(),
             params: vec![
                 self.username.as_str().into(), self.password.as_str().into(),
@@ -298,14 +323,14 @@ impl ClientInner {
         self.tx = BufWriter::new(tx);
 
         self.connect(Some(lock)).await?;
-        while lock.seed_hash.is_empty() {
+        while lock.epoch == 0 {
             assert!(self.handle_notification(Some(lock)).await?.is_none());
         }
         Ok(())
     }
 
     async fn submit(&mut self, job_id: &str, nonce_hex: &str, received_ts: Instant) -> anyhow::Result<()> {
-        let submit = Request {
+        let submit = jsonrpc::Request {
             method: "mining.submit".into(),
             params: vec![
                 self.username.clone().into(), job_id.into(), nonce_hex.into(),

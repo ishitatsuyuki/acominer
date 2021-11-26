@@ -11,6 +11,7 @@
 use sha3::{Digest, Keccak256, Keccak512};
 use byteorder::{LittleEndian, ByteOrder};
 use core::ops::BitXor;
+use std::collections::HashMap;
 
 fn is_prime(x: usize) -> bool{
     miller_rabin::is_prime(&x, 1)
@@ -97,13 +98,12 @@ pub fn get_seed_hash(epoch: usize) -> [u8; 32] {
     s
 }
 
-pub fn epoch_from_seed_hash(seed_hash: [u8; 32], limit: usize) -> Option<usize> {
+pub fn epoch_lut(limit: usize) -> HashMap<[u8; 32], usize> {
     let mut s = [0u8; 32];
+    let mut result = HashMap::with_capacity(limit);
     for epoch in 1..=limit {
         fill_sha256(&s.clone(), &mut s, 0);
-        if s == seed_hash {
-            return Some(epoch);
-        }
+        result.insert(s, epoch);
     }
-    None
+    result
 }
