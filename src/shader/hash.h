@@ -62,7 +62,7 @@ const uvec2 Keccak_f1600_RC[24] = {
     uvec2(0x80008008, 0x80000000),
 };
 
-#define KECCAKF_1600_RND(a, i, outsz) do { \
+#define KECCAKF_1600_RND_A(a) do { \
     uvec2 m0 = a[0] ^ a[5] ^ a[10] ^ a[15] ^ a[20] ^ ROTL64_1(a[2] ^ a[7] ^ a[12] ^ a[17] ^ a[22], 1);\
     uvec2 m1 = a[1] ^ a[6] ^ a[11] ^ a[16] ^ a[21] ^ ROTL64_1(a[3] ^ a[8] ^ a[13] ^ a[18] ^ a[23], 1);\
     uvec2 m2 = a[2] ^ a[7] ^ a[12] ^ a[17] ^ a[22] ^ ROTL64_1(a[4] ^ a[9] ^ a[14] ^ a[19] ^ a[24], 1);\
@@ -124,7 +124,9 @@ const uvec2 Keccak_f1600_RC[24] = {
     a[11] = ROTL64_1(a[7],  6);\
     a[7] = ROTL64_1(a[10],  3);\
     a[10] = ROTL64_1(tmp,  1);\
-    \
+  } while(false)
+
+#define KECCAKF_1600_RND_B(a, i, outsz) do { \
     uvec2 m5 = a[0]; uvec2 m6 = a[1]; a[0] = bitselect(a[0]^a[2],a[0],a[1]); \
     a[0] ^= Keccak_f1600_RC[i]; \
     if (outsz > 1) { \
@@ -142,10 +144,11 @@ const uvec2 Keccak_f1600_RC[24] = {
 
 
 #define KECCAK_PROCESS(st, in_size, out_size)    do { \
-    KECCAKF_1600_RND(st, 0, 25); \
+    KECCAKF_1600_RND_A(st); \
     [[dont_unroll]] \
-    for (int r = 1; r < 24; ++r) { \
-        int os = (r < 23 ? 25 : (out_size));\
-        KECCAKF_1600_RND(st, r, os); \
+    for (int r = 0; r < 23; ++r) { \
+        KECCAKF_1600_RND_B(st, r, 25); \
+        KECCAKF_1600_RND_A(st); \
     } \
+    KECCAKF_1600_RND_B(st, 23, out_size); \
 } while(false)
