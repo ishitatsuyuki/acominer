@@ -26,7 +26,7 @@
 // 2. Substitute i in the "row shuffle" formula with r_j(i) we obtained in step 1.
 //    These two formula forms the C2R scatter step.
 // 3. Use the "column shuffle" formula as-is for the gather step.
-#define C2R_SCATTER_IMPL(sh, m, n, i, j, val) sh[(i-j/(n/m))&(m-1)][((i+j*m)&(n-1))|(j&~(n-1))] = val
+#define C2R_SCATTER_IMPL(sh, m, n, i, j, val) sh[(i-j/(n/m))&(m-1)][i+((j*m)&(n-1))+(j&~(n-1))] = val
 #define C2R_SCATTER(sh, m, n, i, j, val) C2R_SCATTER_IMPL(sh, (m), (n), (i), (j), val)
 #define C2R_GATHER_IMPL(sh, m, n, i, j) sh[(j-i)&(m-1)][j]
 #define C2R_GATHER(sh, m, n, i, j) C2R_GATHER_IMPL(sh, (m), (n), (i), (j))
@@ -35,5 +35,5 @@
 // To obtain the definition, just swap the scatter and gather op above
 #define R2C_SCATTER_IMPL(sh, m, n, i, j, val) sh[(j-i)&(m-1)][j] = val
 #define R2C_SCATTER(sh, m, n, i, j, val) R2C_SCATTER_IMPL(sh, (m), (n), (i), (j), val)
-#define R2C_GATHER_IMPL(sh, m, n, i, j) sh[(i-j/(n/m))&(m-1)][((i+j*m)&(n-1))|(j&~(n-1))]
+#define R2C_GATHER_IMPL(sh, m, n, i, j) sh[(i-j/(n/m))&(m-1)][i+((j*m)&(n-1))+(j&~(n-1))]
 #define R2C_GATHER(sh, m, n, i, j) R2C_GATHER_IMPL(sh, (m), (n), (i), (j))

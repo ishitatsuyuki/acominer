@@ -39,6 +39,7 @@ layout(set = 0, binding = 0) buffer OutBuf {
 // Shuffle scratchpad. The size for the first dimension should be the max `m` parameter used in
 // the code (see also transpose.h)
 shared uint shuf[8][gl_WorkGroupSize];
+shared uint shuf_b[4][gl_WorkGroupSize];
 
 void main() {
     // Work distribution (assuming 64 threads in one workgroup for brevity):
@@ -70,17 +71,12 @@ void main() {
     for (int j = 0; j < 2; j++) {
         for (int i = 0; i < 8; i += 2) {
             C2R_SCATTER(shuf, 4, 32, i/2, th_ix, state[i+j].x);
+            C2R_SCATTER(shuf_b, 4, 32, i/2, th_ix, state[i+j].y);
         }
         barrier();
         for (int t = 0; t < 8; t++) {
             mix[t][j*2] = C2R_GATHER(shuf, 4, 32, t/2, (th_ix & 0x23) | ((th_ix & 0x18) >> 1) | ((t & 1) << 4));
-        }
-        for (int i = 0; i < 8; i += 2) {
-            C2R_SCATTER(shuf, 4, 32, i/2, th_ix, state[i+j].y);
-        }
-        barrier();
-        for (int t = 0; t < 8; t++) {
-            mix[t][j*2+1] = C2R_GATHER(shuf, 4, 32, t/2, (th_ix & 0x23) | ((th_ix & 0x18) >> 1) | ((t & 1) << 4));
+            mix[t][j*2+1] = C2R_GATHER(shuf_b, 4, 32, t/2, (th_ix & 0x23) | ((th_ix & 0x18) >> 1) | ((t & 1) << 4));
         }
     }
     uint s0;
