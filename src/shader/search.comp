@@ -38,7 +38,7 @@ layout(set = 0, binding = 0) buffer OutBuf {
 
 // Shuffle scratchpad. The size for the first dimension should be the max `m` parameter used in
 // the code (see also transpose.h)
-shared uint shuf[8][gl_WorkGroupSize];
+shared uint shuf[28][gl_WorkGroupSize];
 shared uint shuf_b[4][gl_WorkGroupSize];
 
 void main() {
