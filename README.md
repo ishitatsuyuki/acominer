@@ -1,6 +1,6 @@
 # acominer
 
-An experimental ETH miner powered by Vulkan.
+An open source, fast and reliable Ethereum miner.
 
 ## IMPORTANT
 
@@ -35,9 +35,10 @@ If acominers fails with "device out of memory", then you need to override the Vu
 
 ## Features
 
-- Zero mining fee
-- Minimal interference with graphics workload through the use of async compute
-- Dependencies kept to a small amount to make audit easy
+- Zero miner fee
+- Powered by Vulkan
+- Small work dispatch size, gives lower latency
+- Desktop-friendly, mining affects GUI performance minimally
 
 ## Building
 
