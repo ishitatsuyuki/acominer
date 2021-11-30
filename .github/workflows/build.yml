@@ -44,6 +44,7 @@ jobs:
       - run: |
           cd mesa
           sudo bash ./.gitlab-ci/container/build-libdrm.sh
+          sudo bash ./.gitlab-ci/container/build-wayland.sh
           meson build -Ddri-drivers= -Dgallium-drivers= -Dvulkan-drivers=amd -Dllvm=disabled -Dprefix=$PWD/build/install
           cd build
           ninja
