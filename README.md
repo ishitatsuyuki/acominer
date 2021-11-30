@@ -4,9 +4,9 @@ An open source, fast and reliable Ethereum miner.
 
 ## IMPORTANT
 
-acominer requires an AMD graphics card running Linux to run.
-
+- acominer requires an AMD graphics card running Linux to run.  
 **acominer does not support other setups.**
+- TLS is not supported for now. Make sure you connect to an unencrypted port.
 
 ## Running
 
