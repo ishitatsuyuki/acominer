@@ -25,7 +25,7 @@ jobs:
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-focal.list https://packages.lunarg.com/vulkan/lunarg-vulkan-focal.list
           sudo apt update
           sudo apt build-dep libdrm mesa -y
-          sudo apt install cmake vulkan-sdk -y
+          sudo apt install cmake vulkan-sdk python3-pip -y
       - name: Install sccache
         env:
           LINK: https://github.com/mozilla/sccache/releases/download
@@ -43,6 +43,7 @@ jobs:
       - run: git clone https://gitlab.freedesktop.org/ishitatsuyuki/mesa.git -b acominer --depth 1
       - run: |
           cd mesa
+          sudo pip install --upgrade meson
           sudo bash ./.gitlab-ci/container/build-libdrm.sh
           sudo bash ./.gitlab-ci/container/build-wayland.sh
           meson build -Ddri-drivers= -Dgallium-drivers= -Dvulkan-drivers=amd -Dllvm=disabled -Dprefix=$PWD/build/install
