@@ -1261,7 +1261,7 @@ dependencies = [
 [[package]]
 name = "vulkano"
 version = "0.26.0"
-source = "git+https://github.com/ishitatsuyuki/vulkano.git?branch=acominer#a3e48b516485a994c09087058948e881a5081928"
+source = "git+https://github.com/ishitatsuyuki/vulkano.git?branch=acominer#00ee3db274278412b49832223d610c8624f9605a"
 dependencies = [
  "ash",
  "crossbeam-queue",
@@ -1284,7 +1284,7 @@ dependencies = [
 [[package]]
 name = "vulkano-shaders"
 version = "0.26.0"
-source = "git+https://github.com/ishitatsuyuki/vulkano.git?branch=acominer#a3e48b516485a994c09087058948e881a5081928"
+source = "git+https://github.com/ishitatsuyuki/vulkano.git?branch=acominer#00ee3db274278412b49832223d610c8624f9605a"
 dependencies = [
  "fnv",
  "heck",
