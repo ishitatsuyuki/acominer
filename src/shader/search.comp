@@ -115,7 +115,9 @@ void main() {
             uint p = fnv(i ^ s0, mix_i) % dag_size_mix;
 
 #define MIX_INNER(t) {\
-            uint p_idx = swizzleInvocationsMaskedAMD(p, uvec3(0x18, t, 0)) * 8 + th_ix % 8; \
+            uint p_idx = swizzleInvocationsMaskedAMD(p, uvec3(0x1c, t % 4, 0)) * 8; \
+            uint mirrored = swizzleInvocationsMaskedAMD(p_idx, uvec3(0x1f, 0, 7)); \
+            p_idx = th_ix % 8 + (((th_ix & 4) == (t & 4)) ? p_idx : mirrored); \
             uint new_data[4] = conf.dag_read.values[p_idx]; \
             for (int j = 0; j < 4; j++) { \
                 mix[t][j] = fnv(mix[t][j], new_data[j]); \
