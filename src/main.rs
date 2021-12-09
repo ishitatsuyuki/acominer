@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use ash::vk::{CalibratedTimestampInfoEXT, TimeDomainEXT};
 use byteorder::{ByteOrder, LittleEndian};
 use clap::ValueHint;
 use indicatif::ProgressBar;
@@ -19,7 +20,7 @@ use tracing::{error, info};
 use tracing_subscriber;
 use tracing_subscriber::EnvFilter;
 use url::Url;
-use vulkano::{DeviceSize, sync};
+use vulkano::{DeviceSize, sync, VulkanObject};
 use vulkano::buffer::{BufferAccess, BufferUsage, CpuAccessibleBuffer, DeviceLocalBuffer, ImmutableBuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::descriptor_set::{DescriptorSetWithOffsets, layout::DescriptorSetLayout, PersistentDescriptorSet};
@@ -27,19 +28,23 @@ use vulkano::device::{Device, DeviceExtensions, Features, Queue};
 use vulkano::device::physical::{DriverId, PhysicalDevice, QueueFamily};
 use vulkano::instance::{ApplicationInfo, Instance, InstanceExtensions};
 use vulkano::pipeline::{ComputePipeline, Pipeline, PipelineBindPoint};
-use vulkano::sync::{Fence, FenceSignalFuture, FenceWaitError, GpuFuture};
+use vulkano::query::{QueryPool, QueryResultFlags, QueryType};
+use vulkano::sync::{Fence, FenceSignalFuture, FenceWaitError, GpuFuture, PipelineStage};
 use vulkano::Version;
 
 use crate::cache::{get_cache_size, get_full_size, get_seed_hash, make_cache};
+use crate::lfx::LatencyFleX;
 use crate::stratum::{JobInfo, StratumClient};
 
 mod cache;
 mod stratum;
+mod lfx;
 
 const DEVICE_EXTENSIONS: DeviceExtensions = DeviceExtensions {
     khr_storage_buffer_storage_class: true,
     ext_subgroup_size_control: true,
     amd_shader_ballot: true,
+    ext_calibrated_timestamps: true,
     ..DeviceExtensions::none()
 };
 
@@ -111,6 +116,7 @@ struct SearchPipeline {
     pipeline: Arc<ComputePipeline>,
     layout: Arc<DescriptorSetLayout>,
     set: DescriptorSetWithOffsets,
+    query: Arc<QueryPool>,
 }
 
 fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFamily, epoch: usize, count: usize, subgroup_size: u32) -> anyhow::Result<MinerPipeline> {
@@ -167,18 +173,21 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
     let mut search_pipelines = vec![];
     for _ in 0..count {
         let output_buf = {
-            CpuAccessibleBuffer::from_data(device.clone(), BUFFER_USAGE_WITH_TRANSFER, false, search_cs::ty::Output::default())?
+            CpuAccessibleBuffer::from_data(device.clone(), BUFFER_USAGE_WITH_TRANSFER, true, search_cs::ty::Output::default())?
         };
 
         let mut search_set_builder = PersistentDescriptorSet::start(search_layout.clone());
         search_set_builder.add_buffer(output_buf.clone())?;
         let search_set = search_set_builder.build()?;
 
+        let query = QueryPool::new(device.clone(), QueryType::Timestamp, 1)?;
+
         search_pipelines.push(SearchPipeline {
             output_buf,
             pipeline: search_pipeline.clone(),
             layout: search_layout.clone(),
             set: search_set.clone().into(),
+            query,
         });
     }
 
@@ -299,11 +308,10 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                 .long_about("Control the subgroup size to be used on RDNA or later. On Mesa drivers, this defaults to 64.")
         )
         .arg(
-            clap::Arg::new("target hashrate")
-                .long("target-hashrate")
-                .about("Target hashrate for latency reduction")
-                .takes_value(true)
-                .long_about("Set a target hashrate (hash/second) to pace work submission, reducing buffering and latency.")
+            clap::Arg::new("lfx")
+                .long("latencyflex")
+                .about("Enable LatencyFleX (TM) latency reduction")
+                .long_about("Use LatencyFlex (TM) to reduce buffering and latency, and improve system responsiveness.")
         )
         .get_matches();
     let url: Url = app.value_of_t("pool").unwrap();
@@ -334,10 +342,10 @@ Popular wisdoms say that this should be a multiple of your CU count.")
         "type" = ?physical.properties().device_type
     );
 
-    let pipeline_count: usize = app.value_of_t("buffers").unwrap();
+    let num_pipelines: usize = app.value_of_t("buffers").unwrap();
 
     // Now initializing the device.
-    let (device, mut queues) = Device::new(
+    let (device, queues) = Device::new(
         physical,
         &Features {
             shader_int64: true,
@@ -345,10 +353,10 @@ Popular wisdoms say that this should be a multiple of your CU count.")
             ..Features::none()
         },
         &DEVICE_EXTENSIONS,
-        std::iter::once((queue_family, 0.5)),
+        std::iter::repeat((queue_family, 0.5)).take(2),
     )?;
 
-    let queue = queues.next().unwrap();
+    let queues: Vec<_> = queues.collect();
 
     let subgroup_size: u32 = app.value_of_t("subgroup size").unwrap_or_else(|_| physical.properties().subgroup_size.unwrap());
     info!(subgroup_size = subgroup_size);
@@ -357,37 +365,47 @@ Popular wisdoms say that this should be a multiple of your CU count.")
     let wg_count = app.value_of_t::<u64>("workgroups").unwrap() * 64 / subgroup_size as u64;
     let hash_quantum = wg_count * subgroup_size as u64;
 
-    let target_hashrate: Option<u64> = app.value_of_t("target hashrate").ok();
-    let pacing = target_hashrate.map(|x| {
-        Duration::from_secs_f64(hash_quantum as f64 / x as f64)
-    });
-    if let Some(pace) = pacing {
-        info!(?pace, "Pacing is enabled");
-    }
+    let mut lfx = LatencyFleX::default();
+    let mut frames = 0;
     while !stop.load(Ordering::SeqCst) {
         let job = client.current_job();
-        let mut pipeline = build_pipeline(device.clone(), queue.clone(), queue_family, job.epoch, pipeline_count, subgroup_size)?;
+        let mut pipeline = build_pipeline(device.clone(), queues[0].clone(), queue_family, job.epoch, num_pipelines, subgroup_size)?;
+        let period = physical.properties().timestamp_period;
         let mut hash_counter = 0u64;
         let mut start_time = Instant::now();
         let mut current_pipeline = 0;
-        let mut futures: Vec<Option<(FenceSignalFuture<_>, u64, JobInfo)>> = (0..pipeline_count).map(|_| None).collect();
+        let mut futures: Vec<Option<(FenceSignalFuture<_>, u64, u64, JobInfo)>> = (0..num_pipelines).map(|_| None).collect();
         let mut cleanup_counter = 0;
-        let mut last_time = Instant::now();
         loop {
-            let target = pacing.map(|pacing| {
-                let now = Instant::now();
-                let target = (last_time + pacing).max(now);
-                last_time = target;
-                target
-            });
             if let Some((future, ..)) = futures[current_pipeline].as_ref() {
                 future.wait(None)?;
             }
+            let infos = [
+                CalibratedTimestampInfoEXT::builder().time_domain(TimeDomainEXT::CLOCK_MONOTONIC_RAW).build(),
+                CalibratedTimestampInfoEXT::builder().time_domain(TimeDomainEXT::DEVICE).build(),
+            ];
+            let mut calib_ts = [0u64; 2];
+            let mut deviation = [0u64];
+            unsafe {
+                device.fns().ext_calibrated_timestamps.get_calibrated_timestamps_ext(device.internal_object(), 2, infos.as_ptr(), calib_ts.as_mut_ptr(), deviation.as_mut_ptr()).result()?;
+            }
+            let wait_target = if app.is_present("lfx") { lfx.get_wait_target(frames) } else { 0 }.max(calib_ts[0]);
             loop {
-                for i in 0..pipeline_count {
-                    if let Some((future, start_nonce, job)) = futures[i].as_mut() {
+                let mut ts = [0u64];
+                unsafe {
+                    device.fns().ext_calibrated_timestamps.get_calibrated_timestamps_ext(device.internal_object(), 1, infos.as_ptr(), ts.as_mut_ptr(), deviation.as_mut_ptr()).result()?;
+                }
+                let mut timestamps = vec![];
+                for i in 0..num_pipelines {
+                    if let Some((future, frame, start_nonce, job)) = futures[i].as_mut() {
                         if future.get_fence().map(|x| x.ready().unwrap()).unwrap_or(true) {
                             future.wait(None)?;
+                            let mut result = [0u64];
+                            pipeline.search[i].query.queries_range(0..1).unwrap().get_results(&mut result, QueryResultFlags {
+                                wait: true,
+                                ..Default::default()
+                            })?;
+                            timestamps.push((*frame, result[0]));
                             let output_buf = pipeline.search[i].output_buf.read()?;
                             for i in 0..output_buf.output_count {
                                 client.submit(&job, *start_nonce + output_buf.outputs[i as usize].gid as u64);
@@ -396,17 +414,23 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                         }
                     }
                 }
+                timestamps.sort_unstable();
+                if !timestamps.is_empty() {
+                    for (f, t) in timestamps {
+                        let t = (calib_ts[0] as i64 - ((calib_ts[1] as i64 - t as i64) as f32 * period) as i64) as u64;
+                        lfx.end_frame(f, t);
+                    }
+                }
+                let dur = Duration::from_nanos(wait_target.saturating_sub(ts[0]));
                 let wait: Vec<_> = futures.iter_mut().filter_map(|x| x.as_mut().and_then(|x| x.0.get_fence())).map(|x| &*x).collect();
                 if !wait.is_empty() {
-                    match Fence::multi_wait(wait, target.map(|t| t.saturating_duration_since(Instant::now())).or(Some(Duration::ZERO)), false) {
+                    match Fence::multi_wait(wait, Some(dur), false) {
                         Ok(..) => {}
                         Err(FenceWaitError::Timeout) => { break; }
                         Err(x) => panic!("error waiting for fence: {}", x),
                     }
                 } else {
-                    if let Some(target) = target {
-                        std::thread::sleep(target.saturating_duration_since(Instant::now()));
-                    }
+                    std::thread::sleep(dur);
                     break;
                 }
             }
@@ -414,13 +438,14 @@ Popular wisdoms say that this should be a multiple of your CU count.")
             if stop.load(Ordering::SeqCst) || job.epoch != pipeline.epoch
             {
                 cleanup_counter += 1;
-                if cleanup_counter != pipeline_count {
-                    current_pipeline = (current_pipeline + 1) % pipeline_count;
+                if cleanup_counter != num_pipelines {
+                    current_pipeline = (current_pipeline + 1) % num_pipelines;
                     continue;
                 } else {
                     break;
                 }
             }
+            lfx.begin_frame(frames, wait_target);
             let nonce_mask = (!0u64) >> (job.pool_nonce_bytes * 8);
             if ((nonce + hash_quantum) & nonce_mask) < hash_quantum { // Wraparound
                 nonce = 0;
@@ -453,19 +478,35 @@ Popular wisdoms say that this should be a multiple of your CU count.")
             let command_buffer = builder.build()?;
 
             let future = sync::now(device.clone())
-                .then_execute(queue.clone(), command_buffer)?
+                .then_execute(queues[0].clone(), command_buffer)?
+                .then_signal_semaphore_and_flush()?;
+
+            let mut builder = AutoCommandBufferBuilder::primary(
+                device.clone(),
+                queue_family,
+                CommandBufferUsage::OneTimeSubmit,
+            )?;
+            unsafe { builder.reset_query_pool(pipeline.search[current_pipeline].query.clone(), 0..1)?; }
+            unsafe { builder.write_timestamp(pipeline.search[current_pipeline].query.clone(), 0, PipelineStage::AllCommands)?; }
+            unsafe { builder.host_read_barrier(&*pipeline.search[current_pipeline].output_buf); }
+            let command_buffer = builder.build()?;
+
+            let future = future
+                .then_execute(queues[1].clone(), command_buffer)?
                 .then_signal_fence_and_flush()?;
+
             assert!(futures[current_pipeline].is_none());
-            futures[current_pipeline] = Some((future, pipeline.config.start_nonce, job.clone()));
+            futures[current_pipeline] = Some((future, frames, pipeline.config.start_nonce, job.clone()));
 
             nonce += hash_quantum;
             hash_counter += hash_quantum;
             if start_time.elapsed() > Duration::from_secs(5) {
-                println!("{:.02} MH/s", hash_counter as f64 / start_time.elapsed().as_secs_f64() / 1000. / 1000.);
+                println!("{:.02} MH/s {:.02?}", hash_counter as f64 / start_time.elapsed().as_secs_f64() / 1000. / 1000., lfx.latency());
                 start_time = Instant::now();
                 hash_counter = 0;
             }
-            current_pipeline = (current_pipeline + 1) % pipeline_count;
+            current_pipeline = (current_pipeline + 1) % num_pipelines;
+            frames += 1;
         }
     }
     Ok(())
