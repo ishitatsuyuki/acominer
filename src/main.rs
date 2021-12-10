@@ -25,7 +25,7 @@ use vulkano::buffer::{BufferAccess, BufferUsage, CpuAccessibleBuffer, DeviceLoca
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::descriptor_set::{DescriptorSetWithOffsets, layout::DescriptorSetLayout, PersistentDescriptorSet};
 use vulkano::device::{Device, DeviceExtensions, Features, Queue};
-use vulkano::device::physical::{DriverId, PhysicalDevice, QueueFamily};
+use vulkano::device::physical::{PhysicalDevice, QueueFamily};
 use vulkano::instance::{ApplicationInfo, Instance, InstanceExtensions};
 use vulkano::pipeline::{ComputePipeline, Pipeline, PipelineBindPoint};
 use vulkano::query::{QueryPool, QueryResultFlags, QueryType};
@@ -325,10 +325,6 @@ Popular wisdoms say that this should be a multiple of your CU count.")
 
     let device_idx = app.value_of("device").unwrap().parse().unwrap();
     let physical: PhysicalDevice = PhysicalDevice::from_index(&instance, device_idx).ok_or_else(|| anyhow::anyhow!("Device {} not found", device_idx))?;
-    assert_eq!(physical.properties().driver_id, Some(DriverId::MesaRADV));
-    if physical.properties().driver_id == Some(DriverId::AMDOpenSource) {
-        anyhow::bail!("Driver blacklisted: AMDVLK is not supported because it causes system instability with more than 4GB of allocations");
-    }
 
     let queue_family = physical
         .queue_families()
