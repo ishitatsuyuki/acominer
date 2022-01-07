@@ -6,8 +6,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::io::{self, Write};
 use std::num::ParseIntError;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,8 @@ use anyhow::Context;
 use ash::vk::{CalibratedTimestampInfoEXT, TimeDomainEXT};
 use byteorder::{ByteOrder, LittleEndian};
 use clap::ValueHint;
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle, WeakProgressBar};
+use once_cell::sync::Lazy;
 use tracing::{error, info};
 use tracing_subscriber;
 use tracing_subscriber::EnvFilter;
@@ -192,6 +194,7 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
     }
 
     let progress = ProgressBar::new(dag_wg_count);
+    *PROGRESS_BAR.lock().unwrap() = progress.downgrade();
     info!(epoch, "Building DAG...");
     let mut completed = 0;
     while completed != dag_wg_count {
@@ -234,13 +237,55 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
     })
 }
 
+struct SuspendProgressBarWriter<T: Write>(T);
+
+impl<T: Write> SuspendProgressBarWriter<T> {
+    fn suspend<F: FnOnce(&mut Self) -> R, R>(&mut self, f: F) -> R {
+        let handle = PROGRESS_BAR.lock().unwrap().upgrade();
+        if let Some(p) = handle {
+            p.suspend(|| f(self))
+        } else {
+            f(self)
+        }
+    }
+}
+
+static PROGRESS_BAR: Lazy<Mutex<WeakProgressBar>> = Lazy::new(|| Mutex::new(WeakProgressBar::default()));
+
+impl<T: Write> Write for SuspendProgressBarWriter<T> {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.suspend(|this| this.0.write(buf))
+    }
+
+    #[inline]
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        self.suspend(|this| this.0.write_vectored(bufs))
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        self.suspend(|this| this.0.flush())
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.suspend(|this| this.0.write_all(buf))
+    }
+
+    #[inline]
+    fn write_fmt(&mut self, fmt: std::fmt::Arguments<'_>) -> io::Result<()> {
+        self.suspend(|this| this.0.write_fmt(fmt))
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // FIXME: https://github.com/tokio-rs/tracing/issues/735 https://github.com/tokio-rs/tracing/issues/1697
     let log_env = std::env::var(EnvFilter::DEFAULT_ENV).map(|mut s| {
         s.insert_str(0, "info,");
         s
     }).unwrap_or_else(|_| String::from("info"));
-    tracing_subscriber::fmt().with_env_filter(EnvFilter::new(log_env)).init();
+    tracing_subscriber::fmt().with_writer(|| SuspendProgressBarWriter(std::io::stdout())).with_env_filter(EnvFilter::new(log_env)).init();
     let stop = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
         let stop = stop.clone();
@@ -361,8 +406,9 @@ Popular wisdoms say that this should be a multiple of your CU count.")
     let wg_count = app.value_of_t::<u64>("workgroups").unwrap() * 64 / subgroup_size as u64;
     let hash_quantum = wg_count * subgroup_size as u64;
 
-    let mut lfx = LatencyFleX::default();
+    let mut lfx = LatencyFleX::new();
     let mut frames = 0;
+
     while !stop.load(Ordering::SeqCst) {
         let job = client.current_job();
         let mut pipeline = build_pipeline(device.clone(), queues[0].clone(), queue_family, job.epoch, num_pipelines, subgroup_size)?;
@@ -372,6 +418,11 @@ Popular wisdoms say that this should be a multiple of your CU count.")
         let mut current_pipeline = 0;
         let mut futures: Vec<Option<(FenceSignalFuture<_>, u64, u64, JobInfo)>> = (0..num_pipelines).map(|_| None).collect();
         let mut cleanup_counter = 0;
+        let spinner_style = ProgressStyle::default_spinner()
+            .template("{wide_msg}");
+        let progress = ProgressBar::new_spinner();
+        progress.set_style(spinner_style);
+        *PROGRESS_BAR.lock().unwrap() = progress.downgrade();
         loop {
             if let Some((future, ..)) = futures[current_pipeline].as_ref() {
                 future.wait(None)?;
@@ -385,7 +436,8 @@ Popular wisdoms say that this should be a multiple of your CU count.")
             unsafe {
                 device.fns().ext_calibrated_timestamps.get_calibrated_timestamps_ext(device.internal_object(), 2, infos.as_ptr(), calib_ts.as_mut_ptr(), deviation.as_mut_ptr()).result()?;
             }
-            let wait_target = if app.is_present("lfx") { lfx.get_wait_target(frames) } else { 0 }.max(calib_ts[0]);
+            let wait_target = if app.is_present("lfx") { lfx.get_wait_target(frames) } else { 0 };
+            let sleep_target = wait_target.max(calib_ts[0]);
             loop {
                 let mut ts = [0u64];
                 unsafe {
@@ -417,7 +469,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                         lfx.end_frame(f, t);
                     }
                 }
-                let dur = Duration::from_nanos(wait_target.saturating_sub(ts[0]));
+                let dur = Duration::from_nanos(sleep_target.saturating_sub(ts[0]));
                 let wait: Vec<_> = futures.iter_mut().filter_map(|x| x.as_mut().and_then(|x| x.0.get_fence())).map(|x| &*x).collect();
                 if !wait.is_empty() {
                     match Fence::multi_wait(wait, Some(dur), false) {
@@ -441,7 +493,7 @@ Popular wisdoms say that this should be a multiple of your CU count.")
                     break;
                 }
             }
-            lfx.begin_frame(frames, wait_target);
+            lfx.begin_frame(frames, wait_target, sleep_target);
             let nonce_mask = (!0u64) >> (job.pool_nonce_bytes * 8);
             if ((nonce + hash_quantum) & nonce_mask) < hash_quantum { // Wraparound
                 nonce = 0;
@@ -496,8 +548,9 @@ Popular wisdoms say that this should be a multiple of your CU count.")
 
             nonce += hash_quantum;
             hash_counter += hash_quantum;
-            if start_time.elapsed() > Duration::from_secs(5) {
-                println!("{:.02} MH/s {:.02?}", hash_counter as f64 / start_time.elapsed().as_secs_f64() / 1000. / 1000., lfx.latency());
+            if start_time.elapsed() > Duration::from_secs(2) {
+                let status = format!("{:.02} MH/s {:.02?}", hash_counter as f64 / start_time.elapsed().as_secs_f64() / 1000. / 1000., lfx.latency());
+                progress.set_message(status);
                 start_time = Instant::now();
                 hash_counter = 0;
             }
