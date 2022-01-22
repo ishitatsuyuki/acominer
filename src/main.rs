@@ -175,7 +175,7 @@ fn build_pipeline(device: Arc<Device>, queue: Arc<Queue>, queue_family: QueueFam
     let mut search_pipelines = vec![];
     for _ in 0..count {
         let output_buf = {
-            CpuAccessibleBuffer::from_data(device.clone(), BUFFER_USAGE_WITH_TRANSFER, true, search_cs::ty::Output::default())?
+            CpuAccessibleBuffer::from_data(device.clone(), BUFFER_USAGE_WITH_TRANSFER, false, search_cs::ty::Output::default())?
         };
 
         let mut search_set_builder = PersistentDescriptorSet::start(search_layout.clone());
